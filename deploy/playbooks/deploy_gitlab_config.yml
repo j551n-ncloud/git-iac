@@ -1,0 +1,14 @@
+---
+# Applies compose/gitlab/gitlab-extra.rb.j2 to the live gitlab.rb on
+# tools. Kept separate from playbooks/deploy.yml on purpose: that
+# playbook is shared with CI, and gitlab is the one stack CI can never
+# touch (FORBIDDEN_STACKS) - see roles/gitlab_config for why
+# GITLAB_OMNIBUS_CONFIG can't do this job itself.
+#
+# Run by scripts/deploy_gitlab.sh, after the normal docker_stack deploy
+# for the gitlab stack (image tag, ports, etc.) - never on its own.
+- name: Apply gitlab.rb's ansible-managed block
+  hosts: tools
+  gather_facts: false
+  roles:
+    - gitlab_config

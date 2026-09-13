@@ -1,0 +1,5 @@
+---
+# No docker on this host at all, so there is nothing for
+# roles/docker_stack to do. Kept in the inventory so it is known
+# about rather than forgotten.
+stacks: []

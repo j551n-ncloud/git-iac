@@ -1,0 +1,5 @@
+---
+# The self-hosted GitLab Runner that the build repo's pipeline uses.
+# Not managed here - it is the host that would be executing the deploy,
+# so it cannot also be a target of one.
+stacks: []

@@ -1,0 +1,5 @@
+---
+# Edge proxy, configured outside this repo - not managed by this
+# playbook. Leave stacks empty; roles/docker_stack skips hosts with no
+# stacks defined instead of erroring on the docker checks.
+stacks: []

@@ -1,0 +1,111 @@
+---
+# `stack_filter` narrows a run to one stack (or a comma-separated set)
+# without touching the host's other stacks - useful for canarying a
+# freshly adopted stack, or for the stacks that must not be recreated
+# casually:
+#   ansible-playbook ... --limit host-a -e stack_filter=homepage
+- name: Select which of this host's stacks this run applies to
+  ansible.builtin.set_fact:
+    requested_stacks: >-
+      {{ (stacks | default([]))
+         if (stack_filter | default('') | length == 0)
+         else (stacks | default([])
+               | selectattr('name', 'in', stack_filter.split(','))
+               | list) }}
+    forbidden_list: "{{ (forbidden_stacks | default('')).split(',') | select | list }}"
+
+# `forbidden_stacks` is a comma-separated deny list set by the caller
+# (the CI job sets it; a local run normally doesn't), for stacks that
+# would break the thing issuing the deploy - e.g. GitLab deploying
+# itself.
+#
+# Asking for one explicitly is an error, because the request can't be
+# honoured. Having one swept in by a broader selection just drops it,
+# so "deploy everything on this group" still works and simply leaves
+# that stack alone.
+- name: Refuse a forbidden stack that was asked for by name
+  ansible.builtin.fail:
+    msg: >-
+      Refusing to deploy stack '{{ item }}' on {{ inventory_hostname }}:
+      it is in forbidden_stacks ({{ forbidden_stacks }}). Deploying it
+      from here would take down the service running this pipeline -
+      deploy it from a local run instead.
+  loop: "{{ (stack_filter | default('')).split(',') | select | list }}"
+  when:
+    - forbidden_list | length > 0
+    - item in forbidden_list
+
+- name: Drop forbidden stacks from a broad selection
+  ansible.builtin.set_fact:
+    selected_stacks: "{{ requested_stacks | rejectattr('name', 'in', forbidden_list) | list }}"
+
+- name: Note any stacks skipped because they are forbidden here
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: skipping
+      {{ requested_stacks | map(attribute='name') | reject('in', selected_stacks | map(attribute='name') | list) | list | join(', ') }}
+      - in forbidden_stacks, deploy from a local run instead.
+  when: (requested_stacks | length) != (selected_stacks | length)
+
+- name: Report when there is nothing to do on this host
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: no stacks selected
+      {{ '(none defined - not docker-managed by this repo)'
+         if (stacks | default([])) | length == 0
+         else '(nothing left after stack_filter/forbidden_stacks)' }}
+  when: selected_stacks | length == 0
+
+- name: Manage this host's docker stacks
+  when: selected_stacks | length > 0
+  block:
+    - name: Verify docker is present on the target
+      ansible.builtin.command: docker --version
+      register: docker_version
+      changed_when: false
+
+    - name: Verify the docker compose plugin is present
+      ansible.builtin.command: docker compose version
+      register: compose_version
+      changed_when: false
+
+    # Renders every secret-bearing template up front, on the
+    # controller, before a single compose file is written. A missing
+    # vault key would otherwise surface midway through the loop, after
+    # earlier stacks had already been recreated - a half-applied
+    # rollout. lookup('template') raises on an undefined variable and
+    # has no side effects, so this is a pure check.
+    - name: "Pre-flight: every env_vault template for this host renders"
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - (lookup('template', playbook_dir + '/../' + item.compose_src + '/env.j2') | length) > 0
+        fail_msg: >-
+          {{ item.name }}: env.j2 could not be rendered - a vault key or
+          plain var it references is missing. Nothing has been deployed.
+      loop: "{{ selected_stacks | selectattr('env_vault', 'defined') | selectattr('env_vault') | list }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Deploy each selected stack
+      ansible.builtin.include_tasks: stack.yml
+      loop: "{{ selected_stacks }}"
+      loop_control:
+        loop_var: stack
+        label: "{{ stack.name }}"
+
+    # Once per host after every stack, not once per stack - it prunes the
+    # whole host either way, so doing it per stack was just repeated work.
+    #
+    # Uses the docker CLI rather than community.docker.docker_prune,
+    # which talks to the API through the Python docker SDK and so needs
+    # `requests` installed on the target. Alpine hosts here don't have
+    # it, and that failure aborted the whole host mid-deploy: on the
+    # first run it aborted a multi-stack host after its first stack,
+    # so the rest never deployed. The CLI is already a hard requirement
+    # anyway.
+    - name: Prune dangling images
+      ansible.builtin.command: docker image prune -f
+      register: prune_result
+      changed_when: "'Total reclaimed space: 0B' not in prune_result.stdout"
+      when: docker_compose_prune | default(false)

@@ -1,0 +1,21 @@
+---
+# Two compose projects, both in root-owned directories that predate this
+# pipeline, so each one pins its own `path:` rather than taking
+# deploy_root's default.
+stacks:
+  - name: ghost
+    compose_src: compose/ghost
+    path: /root/ghost
+    env_vault: true
+    become: true   # /root/ghost is root-owned; see playbooks/bootstrap.yml
+
+  - name: homepage
+    compose_src: compose/homepage
+    path: /root/homepage
+    become: true   # /root/homepage is root-owned; see playbooks/bootstrap.yml
+
+# Proxmox coordinates for the pre-deploy snapshot (roles/proxmox_snapshot).
+# Mirrors the comment in inventory/hosts.ini; kept as real vars because a
+# comment cannot be read by the role that needs it.
+proxmox_node: node-2
+proxmox_vmid: 111

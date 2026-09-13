@@ -1,0 +1,5 @@
+---
+# The container registry itself. Deliberately not deployed by this
+# pipeline: the pipeline pulls from it, so taking it down mid-run to
+# redeploy it would break the run doing the redeploying.
+stacks: []

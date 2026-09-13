@@ -1,0 +1,498 @@
+---
+# Builds this project's own container images and pushes them to Harbor
+# (registry.example.com), then opens a merge request against services/deploy
+# to bump the compose pin. See README.md for the overall shape. Which
+# images exist isn't hand-maintained anywhere - scripts/discover-images.sh
+# finds every Dockerfile under a changed submodule at run time.
+#
+# Requires a self-hosted GitLab Runner with the "docker" executor,
+# tagged `build` - its own runner, on its own host, deliberately
+# separate from services/deploy's deploy-runner. Two reasons: a stuck or
+# slow image build here shouldn't be able to queue behind (or in front
+# of) a fleet deploy, and this pipeline only needs LAN access to Harbor,
+# not the deploy SSH key or vault password deploy-runner's jobs handle.
+# GitHub Actions is not an option either way: Harbor is internal-only
+# and unreachable from its cloud runners.
+#
+# Required CI/CD variables (Settings > CI/CD > Variables, protected):
+#   HARBOR_URL           Variable type. registry.example.com (no scheme).
+#   HARBOR_PROJECT        Variable type. The Harbor project (namespace)
+#                         images get pushed under, e.g. "library" -
+#                         must already exist in Harbor, this pipeline
+#                         doesn't create one.
+#   HARBOR_ROBOT_USER      Variable type. Harbor robot account username.
+#   HARBOR_ROBOT_TOKEN     Variable type, masked. Robot account token.
+#   DEPLOY_API_TOKEN        Variable type, masked. Project access token
+#                           for services/deploy (Settings > Access
+#                           Tokens on that project), Developer role,
+#                           `api` scope. Used only to open/update the
+#                           compose-bump MR there - a token scoped to
+#                           this pipeline specifically, not the same
+#                           value as deploy's own GITLAB_API_TOKEN,
+#                           since that one is scoped to deploy itself
+#                           and this is a different project calling in.
+#   BUILD_API_TOKEN         Variable type, masked. Project access token
+#                           for THIS project (services/build), Reporter
+#                           role is enough, `api` scope. Used only by the
+#                           scheduled cve-scan job to open/update/close
+#                           the per-image CVE issues. CI_JOB_TOKEN cannot
+#                           create issues, which is why this exists.
+#   GIT_SSH_PRIVATE_KEY     File type. Private half of a keypair whose
+#                           public half is registered as a read-only
+#                           deploy key on any project repo that is
+#                           private. Needed only for those; a public
+#                           project clones over HTTPS with no extra
+#                           credential. Scope it to the repos it must
+#                           read and nothing else.
+#
+# All of the above are CI/CD variables, none of them are baked into this
+# file. README.md has the overall shape.
+
+# The scheduled CVE check lives in its own file: it is the only thing
+# here that runs on a timer rather than on a push, it publishes nothing,
+# and keeping it separate means a change to it cannot disturb the jobs
+# that do publish. Everything cross-cutting (stages, workflow rules,
+# .main_only) stays below, where the interaction between jobs is still
+# visible in one place - that is where this pipeline's bugs have been.
+include:
+  - local: .gitlab/ci/cve-scan.yml
+  - local: .gitlab/ci/submodule-check.yml
+
+stages:
+  - validate
+  - detect
+  - build
+  # Its own stage rather than a `needs:` on the build jobs. Either
+  # build-and-push (a push) or rebuild (the manual lever) produces the
+  # handover files, never both, and a manual job cannot be named in
+  # `needs` without its dependents being skipped whenever nobody plays
+  # it - which is exactly what happened in pipeline 458. Stage ordering
+  # waits for whichever one ran; `dependencies:` below then collects
+  # artifacts from whichever actually produced them.
+  - open-mr
+  # Scheduled CVE check, its own stage so it cannot share a pipeline
+  # with anything that publishes. See the workflow rules below: a
+  # schedule may reach this stage and nothing else.
+  - scan
+
+variables:
+  GIT_DEPTH: 0
+  DEPLOY_PROJECT_PATH: "services/deploy"
+
+# Blocks pipeline creation for anything that isn't a push to main, a
+# merge request, or the one scheduled task this repo has (cve-scan).
+# Every other schedule is still refused outright, and every job that
+# publishes carries its own `schedule -> never` guard on top - belt and
+# braces, because the failure mode is a timer quietly pushing images and
+# opening merge requests on services/deploy.
+workflow:
+  rules:
+    # A schedule may create a pipeline for exactly one task. This used to
+    # refuse every schedule outright, and the reason still holds: nothing
+    # else here is safe on a timer, because a scheduled pipeline has
+    # CI_COMMIT_BRANCH == main and would otherwise satisfy .main_only and
+    # start pushing images and opening merge requests on services/deploy
+    # unattended. The narrow allowance below is paired with a
+    # `schedule -> never` guard on every other job; tests/test_pipeline.py
+    # asserts both halves.
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_TASK =~ /^(cve-scan|submodule-check)$/'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - when: never
+
+# Every job here needs build-runner specifically: LAN access to Harbor
+# and a privileged host for dind. Landing on services/deploy's deploy-runner
+# instead fails in ways that look like anything but a missing tag, so
+# this is a default rather than something to remember per job.
+default:
+  tags:
+    - build
+
+# Jobs that push to a registry or write to services/deploy, i.e.
+# everything except `test`. Merge request pipelines deliberately run
+# only the tests - the protected variables aren't there anyway, and an
+# MR is not a thing that should publish an image.
+.main_only:
+  rules:
+    # First, and not redundant with the workflow rules: on a scheduled
+    # pipeline CI_COMMIT_BRANCH is still main, so without this every job
+    # extending .main_only would run on the timer too.
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+# The scripts below decide what gets built and what gets written to
+# services/deploy, and until this job existed the only way to exercise a
+# change to either was to push it to main - which is also the thing that
+# pushes to Harbor and opens merge requests there. stdlib unittest only,
+# no pytest, so this needs nothing installed beyond an interpreter.
+#
+# Runs on merge requests too, unlike everything below it. That is the
+# point: it is the one job here that is safe on a pipeline with none of
+# the protected variables, because it touches no registry and no API.
+#
+# alpine/git + apk rather than python:3.12-slim + apt-get: the tests
+# shell out to git, and apt-get on Debian is precisely what kept hanging
+# on services/deploy's runner and drove both ci-images into existence.
+# The right home for these packages is ci-image/Dockerfile.build, so
+# this job installs nothing at all - until that image is rebuilt, apk
+# is the cheap and reliable half of the problem.
+#
+# py3-requests is needed to import open_deploy_mr.py at all, not just to
+# reach the network: it imports requests at module scope, and the tests
+# load the module to exercise it against a stub.
+test:
+  stage: validate
+  image:
+    name: alpine/git:latest
+    entrypoint: [""]
+  before_script:
+    - apk add --no-cache python3 py3-yaml py3-requests >/dev/null
+  script:
+    - python3 -m unittest discover -s tests -v
+  # Runs in every pipeline the workflow allows, merge requests included -
+  # except the CVE schedule, which has no source to test and would just
+  # burn a runner nightly.
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - when: on_success
+
+# Finds which submodules moved in this push, then every buildable image
+# inside each one (scripts/discover-images.sh - any directory with a
+# Dockerfile, images.txt no longer exists to hand-maintain). A submodule
+# shows up in `git diff --name-only` as a change to its own path (the
+# gitlink entry), not to any file inside it, so this never needs to
+# recurse into the submodules themselves to detect the change - and
+# can't tell which subpath inside one changed, which is exactly why a
+# multi-image submodule like dashboard rebuilds all its images together
+# whenever its pointer moves, not just the one that actually changed.
+detect-changes:
+  stage: detect
+  # alpine/git's own image ENTRYPOINT is `git`, so without overriding
+  # it here the runner's script execution becomes `git sh -c "..."` -
+  # "git: 'sh' is not a git command." Blank entrypoint lets the
+  # runner's normal shell invocation through instead.
+  extends: .main_only
+  image:
+    name: alpine/git:latest
+    entrypoint: [""]
+  script:
+    - |
+      set -eu
+      # Same CI_COMMIT_BEFORE_SHA handling as services/deploy's
+      # detect-changes: all-zeros on a branch's first push, stale after
+      # a force-push - fall back to the commit's own parent either way.
+      base="${CI_COMMIT_BEFORE_SHA:-}"
+      case "$base" in
+        ''|0000000000000000000000000000000000000000) base="" ;;
+      esac
+      if [ -n "$base" ] && git cat-file -e "${base}^{commit}" 2>/dev/null; then
+        range="${base}..${CI_COMMIT_SHA}"
+      else
+        range="${CI_COMMIT_SHA}~1..${CI_COMMIT_SHA}"
+      fi
+      echo "diff range: $range"
+      git diff --name-only "$range" > changed.txt
+      sed 's/^/  /' changed.txt
+    - |
+      set -eu
+      # Which of the changed paths are actually submodule gitlinks
+      # (from .gitmodules), vs. an ordinary file change (this file,
+      # README.md) that isn't a build trigger. Deliberately stops here -
+      # this job doesn't check out submodule content (dashboard is private
+      # and needs an SSH identity to fetch at all, see build-and-push),
+      # so it can only ever know a submodule's *pointer* moved, not
+      # what's actually inside it. Turning that into "which images
+      # need building" needs the real file tree, which is why
+      # build-and-push does that part itself, right after its own
+      # (already SSH-authenticated) submodule checkout.
+      git config -f .gitmodules --get-regexp 'submodule\..*\.path' 2>/dev/null \
+        | awk '{print $2}' > all_submodules.txt
+      grep -Fxf all_submodules.txt changed.txt > changed_submodules.txt || true
+      echo "changed submodules: $(tr '\n' ' ' < changed_submodules.txt)"
+  artifacts:
+    paths:
+      - changed_submodules.txt
+    expire_in: 1 hour
+
+# Everything an image build needs before it can build anything: the
+# docker daemon, an SSH identity for the private submodule, a clean
+# submodule checkout, and a Harbor login. Shared by the automatic job
+# and the manual rebuild below, so the two cannot drift.
+#
+# ghcr.io/example-org/build-ci-image (source: the ci-image/ submodule,
+# same GitHub repo + Actions that build deploy-ci-image for
+# services/deploy, just a different Dockerfile in it) - docker CLI,
+# git and openssh-client all baked in, so this doesn't `apk add` on
+# every run. docker:27-dind is still the actual daemon this talks to;
+# the job image only needs the client plus git/ssh for the submodule
+# fetch below.
+.image_build:
+  image: ghcr.io/example-org/build-ci-image:latest
+  services:
+    # if-not-present, not the runner's default `always` - this image
+    # changes rarely, and re-pulling ~230MB before every job just to
+    # then wait up to 30s for "services to be up and running" adds
+    # real time for no benefit once it's already cached on
+    # build-runner. build-ci-image itself still pulls :latest fresh
+    # (the job's own `image:` isn't touched here) since a fix pushed
+    # there should take effect on the very next run.
+    - name: docker:27-dind
+      pull_policy: if-not-present
+      # DOCKER_TLS_CERTDIR="" alone isn't enough: without --tls=false
+      # too, dockerd still binds successfully but deliberately delays
+      # its own startup to show a "binding without --tlsverify is
+      # insecure" deprecation warning ("Startup is intentionally being
+      # slowed down to show this message") - a real, variable delay
+      # that can outlast whatever window the job has before it tries
+      # to connect. Passing both together, confirmed locally, starts
+      # clean and fast with no warning at all.
+      command: ["--tls=false"]
+  # Serialises every job that pushes to Harbor. Two pushes landing
+  # close together, or a manual rebuild fired while the automatic job
+  # is mid-run, would otherwise race the same registry and the same
+  # reused workspace.
+  #
+  # Deliberately NOT `interruptible: true`, which is the reflex here
+  # and is wrong: detect-changes only ever diffs its own push range, so
+  # cancelling a superseded pipeline means the submodule bump it was
+  # carrying is never built by anything, and the next pipeline's range
+  # starts after it. Serialise, don't cancel.
+  resource_group: harbor-build
+  variables:
+    # No TLS between this job and its own dind sidecar, deliberately.
+    # This isn't a shared daemon anyone else can reach - it's a
+    # throwaway service on this one job's own private per-build
+    # network, torn down when the job ends. TLS here buys no real
+    # security and its cert generation is a race: the service can
+    # accept TCP connections before /certs/client/ca.pem actually
+    # exists ("unable to resolve docker endpoint: open
+    # /certs/client/ca.pem: no such file or directory"), which is
+    # exactly the class of flake this pipeline can't afford more of.
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    # GitLab's own automatic submodule checkout happens during "Getting
+    # source", before before_script (and therefore before any ssh-agent
+    # setup) ever runs - it has no way to authenticate to a private
+    # submodule like projects/dashboard and just fails outright ("cannot
+    # run ssh: No such file or directory" on the old docker:27 image,
+    # which had no ssh client either). Disabling it here and doing it
+    # ourselves in before_script, after the key is loaded, is the only
+    # order that actually works.
+    GIT_SUBMODULE_STRATEGY: none
+  before_script:
+    - eval "$(ssh-agent -s)" >/dev/null
+    - |
+      if [ -z "${GIT_SSH_PRIVATE_KEY:-}" ]; then
+        echo "GIT_SSH_PRIVATE_KEY is empty - needed to fetch the private projects/dashboard submodule over SSH." >&2
+        exit 1
+      fi
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    # File-type variables are written by the runner with mode 0666 -
+    # ssh-add refuses a world-accessible private key outright
+    # ("UNPROTECTED PRIVATE KEY FILE ... This private key will be
+    # ignored"), same gotcha services/deploy already hit for its own
+    # SSH_PRIVATE_KEY. Copy to a 0600 file rather than adding in place.
+    - install -m 600 "$GIT_SSH_PRIVATE_KEY" ~/.ssh/build_key
+    - ssh-add ~/.ssh/build_key
+    # github.com is the only host reached here, and unlike the LAN
+    # targets services/deploy connects to, it publishes stable host
+    # keys worth pinning. ssh-keyscan is not verification on its own
+    # (it trusts the first answer), but it does stop the fetch from
+    # accepting a changed key later, which blanket StrictHostKeyChecking
+    # no never would.
+    - ssh-keyscan -t rsa,ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+    - ssh-keyscan -p 2224 -t rsa,ed25519 ssh.gitlab.example.com >> ~/.ssh/known_hosts 2>/dev/null
+    # GitLab Runner's own local object-cache reuse for repeated clones
+    # on the same runner surfaces as a file:// transport attempt during
+    # recursive submodule fetches - git 2.38+ blocks that by default
+    # (CVE-2022-39253 hardening: "fatal: transport 'file' not allowed").
+    # Single-purpose trusted runner, only ever fetching this project's
+    # own registered submodules - safe to re-allow.
+    - git config --global protocol.file.allow always
+    # build-runner reuses its workspace across job runs (this repo's
+    # default GIT_STRATEGY is fetch, not clone) - a submodule left in a
+    # broken state by an earlier failed attempt (a stale gitlink, a
+    # remote missing because a prior run got killed mid-fetch) would
+    # otherwise poison every run after it. Deinit + wipe first so this
+    # always starts from a clean slate, regardless of what an earlier
+    # run in this same workspace left behind.
+    - git submodule deinit -f --all
+    - rm -rf .git/modules
+    - git submodule sync
+    - git submodule update --init
+    - |
+      set -eu
+      for v in HARBOR_URL HARBOR_PROJECT HARBOR_ROBOT_USER HARBOR_ROBOT_TOKEN; do
+        eval "val=\${$v:-}"
+        if [ -z "$val" ]; then
+          echo "$v is empty - see this file's header comment." >&2
+          exit 1
+        fi
+      done
+      echo "$HARBOR_ROBOT_TOKEN" | docker login "$HARBOR_URL" -u "$HARBOR_ROBOT_USER" --password-stdin
+    # A buildkit builder, so build-images.sh can keep a layer cache in
+    # Harbor itself. buildx's default "docker" driver cannot export a
+    # registry cache at all, hence docker-container. Failure here is
+    # not fatal: build-images.sh checks for a working builder and falls
+    # back to a plain uncached build, so a missing or broken buildx
+    # makes this pipeline slow rather than red.
+    - |
+      if [ "${BUILD_CACHE:-true}" = "true" ]; then
+        docker buildx create --name harbor-cache --driver docker-container --use >/dev/null 2>&1 \
+          || echo "buildx unavailable - builds will run uncached."
+      fi
+  after_script:
+    # Dangling images only, same as roles/docker_stack's routine prune
+    # in services/deploy - the deps/builder stages' intermediate layers
+    # never get pushed but still pile up on this runner's disk over
+    # repeated builds otherwise. `docker image prune` (not the broader
+    # `system prune`, which also touches networks/build cache) never
+    # removes a tagged image, including the one(s) just built and
+    # pushed - only untagged, unreferenced layers. Reclaiming
+    # tagged-but-unused images (`-a`) is a manual, visibility-first
+    # operation elsewhere in this fleet (fleet-report), never
+    # automatic - same rule here.
+    #
+    # In after_script so it still runs when the build itself failed,
+    # which is exactly when a half-finished layer pile gets left behind.
+    - docker image prune -f || true
+
+# Builds whatever the push changed. The build loop itself lives in
+# scripts/build-images.sh rather than inline here, so that this job and
+# `rebuild` below run the same code and so it can be tested without a
+# runner (tests/test_build_images.py).
+build-and-push:
+  extends:
+    - .image_build
+    - .main_only
+  stage: build
+  needs:
+    - test
+    - detect-changes
+  script:
+    - sh scripts/build-images.sh changed_submodules.txt
+  # Plain path artifact, not a `dotenv` report - open-deploy-mr reads
+  # this file directly (scripts/open_deploy_mr.py's load_built_images),
+  # it never relied on GitLab's own dotenv variable-injection between
+  # jobs. That distinction matters: dotenv's key validation rejects
+  # hyphens ("Key can contain only letters, digits and '_'"), and image
+  # names here (docs-site, dashboard-api, ...) have them.
+  artifacts:
+    paths:
+      - built_images.env
+      # The git-stack half of the same handover: which submodules moved
+      # and to which full commit, so open_deploy_mr.py can bump a
+      # `version:` pin as well as an `image:` tag.
+      - built_submodules.tsv
+    expire_in: 1 hour
+
+# The manual counterpart, the way `deploy` is to `auto-deploy` in
+# services/deploy. Without it the only way to rebuild anything is an
+# empty submodule bump, which is a lie in the history of whichever repo
+# you push it to.
+#
+# Run pipeline > Variables, or the API's `variables`:
+#   REBUILD_SUBMODULES="docs-site"          just that one
+#   REBUILD_SUBMODULES="docs-site dashboard"   several
+#   (unset)                              every registered submodule
+#   FORCE_REBUILD="true"                 also rebuild tags Harbor has
+#
+# FORCE_REBUILD is the one that needs thought. Tags here are the
+# submodule's own commit SHA, so without it a rebuild of unchanged
+# source is correctly a no-op. With it, an existing tag ends up
+# pointing at different bytes - which is sometimes exactly right (the
+# same source rebuilt against a patched base image is a genuinely
+# different artifact) and is sometimes rewriting history under a stack
+# that already deployed that tag. Off by default for that reason.
+rebuild:
+  extends: .image_build
+  stage: build
+  needs:
+    - test
+  variables:
+    REBUILD_SUBMODULES: ""
+    FORCE_REBUILD: "false"
+  script:
+    - |
+      set -eu
+      if [ -n "${REBUILD_SUBMODULES:-}" ]; then
+        : > rebuild_submodules.txt
+        for name in $REBUILD_SUBMODULES; do
+          path="projects/$name"
+          if [ ! -d "$path" ]; then
+            echo "no such submodule: $path" >&2
+            echo "registered: $(git config -f .gitmodules --get-regexp 'submodule\..*\.path' | awk '{print $2}' | tr '\n' ' ')" >&2
+            exit 1
+          fi
+          echo "$path" >> rebuild_submodules.txt
+        done
+      else
+        git config -f .gitmodules --get-regexp 'submodule\..*\.path' \
+          | awk '{print $2}' > rebuild_submodules.txt
+      fi
+      echo "rebuilding: $(tr '\n' ' ' < rebuild_submodules.txt)"
+    - sh scripts/build-images.sh rebuild_submodules.txt
+  artifacts:
+    paths:
+      - built_images.env
+      # The git-stack half of the same handover: which submodules moved
+      # and to which full commit, so open_deploy_mr.py can bump a
+      # `version:` pin as well as an `image:` tag.
+      - built_submodules.tsv
+    expire_in: 1 hour
+  # allow_failure so an un-run manual job leaves the pipeline green
+  # rather than "blocked". services/deploy's manual `deploy` job omits
+  # this, but that one is the normal way to deploy something; this is a
+  # recovery lever that should sit unused for months at a time.
+  rules:
+    # Not covered by .main_only - this job extends .image_build only - so
+    # it needs the schedule guard itself. A scheduled pipeline still has
+    # CI_COMMIT_BRANCH == main, and this is the job that force-rebuilds
+    # and overwrites Harbor tags. Manual means it would not fire on its
+    # own, but it has no business being offered on a CVE-scan pipeline.
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+      allow_failure: true
+
+# Opens/updates a merge request on services/deploy bumping whichever
+# stack's compose file already points at the image(s) just pushed.
+# Never creates a new stack there and never touches a compose file that
+# isn't already pointing at this exact Harbor image path - see
+# scripts/open_deploy_mr.py and README.md's naming convention.
+#
+# A human still merges that MR - this job's own reach ends at opening
+# it. Merging is what actually redeploys, via deploy's existing
+# auto-deploy, same as any other compose change.
+open-deploy-mr:
+  extends: .main_only
+  stage: open-mr
+  image: python:3.12-slim
+  # Writes branches and merge requests on another project. Two of these
+  # running at once would race the same build/<name> branch, so they
+  # serialise - a separate group from harbor-build, since this job
+  # touches no registry and there's no reason for it to queue behind a
+  # long image build.
+  resource_group: deploy-mr
+  # No `needs:` on purpose - see the open-mr stage comment. Both
+  # producers of built_images.env / built_submodules.tsv are listed
+  # here, and a job that didn't run simply contributes no artifacts.
+  # Listing only build-and-push meant a manual rebuild pushed new images
+  # to Harbor and then opened nothing: the one path where you are
+  # already recovering from something was the one where the handover
+  # silently stopped.
+  dependencies:
+    - build-and-push
+    - rebuild
+  before_script:
+    # pyyaml: open_deploy_mr.py parses deploy's host_vars to find the
+    # git_stacks entry matching a submodule. Read-only - the edit itself
+    # is a line change, so the file's comments survive.
+    - pip install --quiet requests pyyaml
+  script:
+    - python3 scripts/open_deploy_mr.py

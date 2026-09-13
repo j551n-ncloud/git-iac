@@ -1,0 +1,7 @@
+# Same idea as group_vars/production/vault.yml.example — create the
+# real file with:
+#   ansible-vault create group_vars/staging/vault.yml
+#
+# ---
+# vault_api_token: "replace-me"
+# vault_db_password: "replace-me"

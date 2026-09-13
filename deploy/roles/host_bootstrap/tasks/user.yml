@@ -1,0 +1,23 @@
+---
+# The account routine deploys connect as. Note this uses `deploy_user`,
+# never `ansible_user`: bootstrap has to connect as some other admin
+# (root) on a host where this account doesn't exist yet, and overriding
+# the connection user must not change which account gets created.
+
+- name: Ensure the docker group exists
+  ansible.builtin.group:
+    name: docker
+    state: present
+
+- name: Create the deploy user
+  ansible.builtin.user:
+    name: "{{ deploy_user }}"
+    groups: docker
+    append: true
+    shell: "{{ deploy_user_shell }}"
+    create_home: true
+    # '*' = no usable password (key-only account) rather than '!'
+    # (locked). OpenSSH refuses *every* auth method, pubkey included,
+    # for a locked account when UsePAM is off - the default on Alpine,
+    # where several of these hosts run.
+    password: "*"

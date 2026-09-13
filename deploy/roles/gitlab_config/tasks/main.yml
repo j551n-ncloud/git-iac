@@ -1,0 +1,57 @@
+---
+# Manages the settings compose/gitlab/docker-compose.yml's
+# GITLAB_OMNIBUS_CONFIG cannot. Found 2026-09-11: that env var only
+# seeds a brand new /etc/gitlab/gitlab.rb - this image's own entrypoint
+# (/assets/init-container inside the container) copies the bare
+# template to gitlab.rb ONLY if that file doesn't exist yet, and the
+# only other reference to GITLAB_OMNIBUS_CONFIG in the whole script
+# clears it before starting the service supervisor. Nothing in the
+# entrypoint, the cookbooks, or the config recipe ever writes that env
+# var's content into gitlab.rb. Confirmed by reading that script
+# directly, after a real deploy with `from_file(...)` in
+# GITLAB_OMNIBUS_CONFIG had silently done nothing - tools's gitlab.rb
+# already existed (long before this repo managed the stack), so that
+# whole mechanism was a no-op from the start.
+#
+# So this manages /DATA/gitlab/config/gitlab.rb directly instead - the
+# same file the container's own startup message tells you to hand-edit
+# ("docker exec -it gitlab editor /etc/gitlab/gitlab.rb"). A managed
+# block at the end of the file, not the whole thing: gitlab.rb predates
+# this repo, and mixlib-config (what gitlab.rb is parsed with) takes
+# the LAST assignment of any given key, so this block's settings win
+# over whatever is already set earlier in the file, without needing to
+# touch or remove those older lines. See
+# compose/gitlab/gitlab-extra.rb.j2's header for what's actually in it,
+# including which lines are genuinely new vs. reproducing (and now
+# duplicating, harmlessly) something already set higher up.
+#
+# root-owned, mode 0644 - become: true is required. tools is already
+# bootstrapped for become: the sudo grant only fires once a host has
+# any become: true stack.
+- name: Manage the ansible-managed block in gitlab.rb
+  become: true
+  ansible.builtin.blockinfile:
+    path: /DATA/gitlab/config/gitlab.rb
+    marker: "# {mark} ANSIBLE MANAGED BLOCK (gitlab-extra.rb.j2)"
+    block: "{{ lookup('template', playbook_dir + '/../compose/gitlab/gitlab-extra.rb.j2') }}"
+    insertafter: EOF
+  register: gitlab_rb_block
+
+# gitlab-ctl reconfigure re-reads gitlab.rb and re-converges the
+# running services in place - no container restart needed (unlike the
+# entrypoint's own advice, which assumes you can't exec into a
+# long-running container the way we just did). Only runs when the
+# block actually changed, so a routine run that touched nothing here
+# doesn't pay GitLab's multi-second reconfigure cost every time. No
+# become: the deploy user is already in the `docker` group (see
+# roles/host_bootstrap), which is enough to exec into a container.
+- name: Reconfigure GitLab if the managed block changed
+  ansible.builtin.command: docker exec gitlab gitlab-ctl reconfigure
+  when: gitlab_rb_block.changed
+  register: gitlab_reconfigure
+  changed_when: true
+  # Same 15m gate as this stack's own health_retries in
+  # inventory/host_vars/tools.yml - a version bump's migrations and a
+  # config-only reconfigure share the same worst case.
+  async: 900
+  poll: 15

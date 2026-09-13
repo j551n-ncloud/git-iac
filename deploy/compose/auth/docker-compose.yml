@@ -1,0 +1,39 @@
+services:
+  pocket-id:
+    # Upgraded 2026-09-10 from the pinned dev-build digest ("next",
+    # built 2026-06-29 - no version string reproduced it, see git log
+    # for the old comment) to the stable release. This isn't a no-op:
+    # a dev build may have applied migrations a stable release doesn't
+    # expect. Safety net is auto-deploy's pre-deploy Proxmox snapshot -
+    # /root/auth/data lives inside this LXC's own rootfs, not a separate
+    # Proxmox mountpoint (see the Roadmap wiki page), so that snapshot covers it too.
+    # If pocket-id doesn't come up healthy after this deploys, roll the
+    # LXC back to the pre-deploy snapshot rather than debugging forward.
+    image: ghcr.io/pocket-id/pocket-id:v2.14.0
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - 3007:1411
+    volumes:
+      # Bind mount, and `path:` in host_vars keeps this stack at
+      # /root/auth, so this resolves to the same directory the running
+      # container already uses. Do not change either without moving
+      # the data.
+      - "/root/auth/data:/app/data"
+    # Diagnosed 2026-09-10: the v2.14.0 image is Alpine/busybox-based
+    # and has no `curl` at all ("executable file not found in $PATH"),
+    # so the old healthcheck failed every single cycle regardless of
+    # whether the app was healthy - confirmed via `docker exec ...
+    # curl` and the app's own logs serving real OIDC traffic 200/302
+    # the entire time it reported "unhealthy". Fixed two things at
+    # once: wget is what's actually in this image (busybox), and
+    # localhost:1411 (the container's own port, see `ports:` above)
+    # instead of the public hostname - no reason for a liveness check
+    # to depend on DNS/routing back in through Cloudflare when the app
+    # is right here.
+    healthcheck:
+      test: "wget -q -O /dev/null http://localhost:1411/healthz"
+      interval: 1m30s
+      timeout: 5s
+      retries: 2
+      start_period: 10s

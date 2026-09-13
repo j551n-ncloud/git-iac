@@ -1,0 +1,27 @@
+---
+# Pre-creates every directory a routine deploy will write into, so
+# playbooks/deploy.yml never needs root for the non-become stacks.
+# `file` creates missing parents too, so a custom `path:` pointing
+# somewhere entirely new works without extra steps.
+
+- name: Create the stacks root directory
+  ansible.builtin.file:
+    path: "{{ deploy_root }}"
+    state: directory
+    owner: "{{ deploy_user }}"
+    group: docker
+    mode: "0750"
+
+- name: Create each stack's directory (default and custom path:)
+  ansible.builtin.file:
+    path: "{{ stack.path | default(deploy_root + '/' + stack.name) }}"
+    state: directory
+    # A become-stack lives somewhere that has to stay root-owned
+    # (e.g. under /root), so don't chown it to the deploy user.
+    owner: "{{ 'root' if (stack.become | default(false)) else deploy_user }}"
+    group: docker
+    mode: "0750"
+  loop: "{{ stacks | default([]) }}"
+  loop_control:
+    loop_var: stack
+    label: "{{ stack.name }}"

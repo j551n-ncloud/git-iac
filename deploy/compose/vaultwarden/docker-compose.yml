@@ -1,0 +1,27 @@
+services:
+  vaultwarden:
+    # 1.36.0 was what ran before this repo took over; 1.37.2 (2026-08-22)
+    # is the current stable. Vaultwarden applies DB migrations on
+    # startup and they are not reversible, so snapshot/back up the
+    # vault_vaultwarden_data volume before the first deploy of this bump.
+    image: vaultwarden/server:1.37.2
+    container_name: vaultwarden
+    restart: unless-stopped
+    ports:
+      - "8083:80"
+    environment:
+      ADMIN_TOKEN: ${VAULTWARDEN_ADMIN_TOKEN}
+      ROCKET_ADDRESS: 0.0.0.0
+      ROCKET_PORT: "80"
+      ROCKET_PROFILE: release
+      SIGNUPS_ALLOWED: "false"
+      DOMAIN: https://vault.example.com
+      WEBAUTHN_ENABLED: "true"
+      ENABLE_WEBSOCKET: "true"
+    volumes:
+      - vaultwarden_data:/data
+
+volumes:
+  vaultwarden_data:
+    external: true
+    name: vault_vaultwarden_data

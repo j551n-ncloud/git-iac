@@ -1,0 +1,20 @@
+# The registry of image sources. Everything downstream enumerates from
+# this file: the pipeline's change detection, the daily staleness check,
+# and the merge request opened against the deploy repo.
+#
+# In the upstream setup each entry is a real git submodule pointing at
+# its own source repo. In this public fork the two sample projects are
+# checked in under projects/ directly, so the repo is clonable and the
+# pipeline is runnable without access to any private repo. The entries
+# stay here because they are what the tooling reads.
+#
+# Both URL styles are shown on purpose. A public project can be fetched
+# over HTTPS; a private one needs SSH, and the pipeline loads a key that
+# works on both forges (see GIT_SSH_PRIVATE_KEY in .gitlab-ci.yml).
+# Note the SSH host and port can differ from the web host.
+[submodule "projects/dashboard"]
+	path = projects/dashboard
+	url = ssh://git@ssh.gitlab.example.com:2224/example-group/dashboard.git
+[submodule "projects/docs-site"]
+	path = projects/docs-site
+	url = https://gitlab.example.com/example-group/docs-site.git

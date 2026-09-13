@@ -1,0 +1,35 @@
+---
+# Runs one compose project, "auth" (pocket-id), in a root-owned
+# directory that predates this pipeline.
+stacks:
+  - name: auth
+    compose_src: compose/auth
+    # pocket-id's own healthcheck (compose/auth/docker-compose.yml) has
+    # a 90s interval and 10s start_period, so its FIRST result can't
+    # land before ~100s after the container starts. The default 12
+    # retries * 5s = 60s window can't ever see it - it always times out
+    # on "starting", not because anything is actually wrong. 24 retries
+    # * 5s = 120s comfortably covers one full interval plus margin.
+    health_retries: 24
+    path: /root/auth
+    become: true      # /root/auth is root-owned
+    env_vault: true   # renders compose/auth/env.j2 -> /root/auth/.env
+
+# Non-secret half of pocket-id's .env. The two secrets it also needs
+# (ENCRYPTION_KEY, MAXMIND_LICENSE_KEY) live in the vault as
+# vault_pocketid_* - see compose/auth/env.j2, which assembles both
+# halves into the rendered .env.
+pocketid_app_url: "https://auth.example.com"
+pocketid_trust_proxy: "true"
+pocketid_puid: "1000"
+pocketid_pgid: "1000"
+pocketid_geolite_db_path: "data/GeoLite2-City.mmdb"
+# Contains a literal %s that pocket-id substitutes with the license
+# key at runtime, so it must not be templated or escaped here.
+pocketid_geolite_db_url: "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&license_key=%s&suffix=tar.gz"
+
+# Proxmox coordinates for the pre-deploy snapshot (roles/proxmox_snapshot).
+# Mirrors the comment in inventory/hosts.ini; kept as real vars because a
+# comment cannot be read by the role that needs it.
+proxmox_node: node-2
+proxmox_vmid: 202

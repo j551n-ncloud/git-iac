@@ -1,0 +1,4 @@
+---
+# Stacks whose deployable unit is a whole git repo, not a single
+# compose file - see tasks/main.yml for why that needed its own role.
+git_stacks: []

@@ -1,0 +1,4 @@
+---
+deploy_root: /opt/stacks
+stacks: []
+docker_compose_prune: false

@@ -1,0 +1,16 @@
+---
+# Only hosts with at least one `become: true` stack get this, which is
+# why most hosts skip it (only host-a and host-c have one).
+#
+# Be aware what it costs: passwordless sudo makes the CI
+# SSH_PRIVATE_KEY root-equivalent on that host. Chowning the stack's
+# directory to the deploy user and dropping `become: true` is the
+# better end state wherever that's possible.
+
+- name: "Grant the deploy user passwordless sudo (only for become: true stacks)"
+  ansible.builtin.copy:
+    dest: /etc/sudoers.d/{{ deploy_user }}-deploy
+    content: "{{ deploy_user }} ALL=(root) NOPASSWD:ALL\n"
+    mode: "0440"
+    validate: "visudo -cf %s"
+  when: stacks | default([]) | selectattr('become', 'defined') | selectattr('become') | list | length > 0

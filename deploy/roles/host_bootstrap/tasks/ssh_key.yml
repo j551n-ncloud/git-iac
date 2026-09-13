@@ -1,0 +1,49 @@
+---
+# Don't assume ~/.ssh/authorized_keys. Hosts here vary - the Debian 13
+# ones (vaultwarden, pocketid) use
+# `AuthorizedKeysFile /etc/ssh/authorized_keys/%u` - and writing to the
+# wrong path fails *silently*: the key looks installed, sshd never
+# reads it, and login just says "Permission denied".
+
+- name: Ask sshd where it actually looks for authorized keys
+  ansible.builtin.command: sshd -T
+  register: sshd_effective
+  changed_when: false
+  failed_when: false
+
+- name: Resolve this host's authorized_keys path for the deploy user
+  ansible.builtin.set_fact:
+    deploy_akf: >-
+      {{ (sshd_effective.stdout_lines | default([])
+          | select('match', '^authorizedkeysfile ')
+          | list | first
+          | default('authorizedkeysfile .ssh/authorized_keys')
+         ).split()[1] | replace('%u', deploy_user) }}
+
+- name: Report the resolved path
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }}: sshd reads keys from {{ deploy_akf }}"
+
+- name: Ensure a custom authorized_keys directory exists
+  ansible.builtin.file:
+    path: "{{ deploy_akf | dirname }}"
+    state: directory
+    owner: root
+    mode: "0755"
+  when: deploy_akf is match('/')
+
+- name: Install the deploy user's authorized key (sshd's custom location)
+  ansible.posix.authorized_key:
+    user: "{{ deploy_user }}"
+    state: present
+    key: "{{ deploy_public_key }}"
+    path: "{{ deploy_akf }}"
+    manage_dir: false
+  when: deploy_akf is match('/')
+
+- name: Install the deploy user's authorized key (default ~/.ssh location)
+  ansible.posix.authorized_key:
+    user: "{{ deploy_user }}"
+    state: present
+    key: "{{ deploy_public_key }}"
+  when: not (deploy_akf is match('/'))

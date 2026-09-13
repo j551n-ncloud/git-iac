@@ -1,0 +1,15 @@
+---
+# Fallback location for any stack that doesn't set its own `path:`.
+# In practice every production host defines its own stack(s) in
+# host_vars/<hostname>.yml with an explicit path: matching wherever
+# that service already lives, so this rarely applies - it's here so
+# deploy_root is never simply undefined.
+deploy_root: /opt/stacks
+
+# No stacks are shared across every production host: some hosts run
+# exactly one service, others run several, and none of them run the
+# same set. Each host's stacks live in host_vars/<hostname>.yml
+# instead (see host_vars/HOSTNAME.yml.example).
+stacks: []
+
+docker_compose_prune: true

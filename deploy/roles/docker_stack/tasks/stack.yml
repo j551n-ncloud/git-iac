@@ -1,0 +1,184 @@
+---
+# Included once per entry in `stacks`, with the current item available
+# as `stack` (see roles/docker_stack/tasks/main.yml).
+#
+# Remote location: defaults to {{ deploy_root }}/{{ stack.name }}, but
+# a stack can pin its own path with `path:`, e.g.:
+#   stacks:
+#     - name: web
+#       compose_src: compose/web
+#       path: /srv/web            # overrides deploy_root for this stack only
+#
+# Elevation: most stacks are owned by the deploy user and run without
+# become (the routine default). A stack that already lives somewhere
+# only root can write to can set `become: true` instead of having its
+# directory ownership changed - e.g.:
+#   stacks:
+#     - name: ghost
+#       compose_src: compose/ghost
+#       path: /root/ghost
+#       become: true
+
+- name: "{{ stack.name }} | Resolve remote stack directory"
+  ansible.builtin.set_fact:
+    stack_path: "{{ stack.path | default(deploy_root + '/' + stack.name) }}"
+
+- name: "{{ stack.name }} | Manage stack files and containers"
+  become: "{{ stack.become | default(false) }}"
+  block:
+    - name: "{{ stack.name }} | Ensure remote stack directory exists"
+      ansible.builtin.file:
+        path: "{{ stack_path }}"
+        state: directory
+        owner: "{{ 'root' if (stack.become | default(false)) else deploy_user }}"
+        mode: "0750"
+
+    - name: "{{ stack.name }} | Copy docker-compose.yml"
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../{{ stack.compose_src }}/docker-compose.yml"
+        dest: "{{ stack_path }}/docker-compose.yml"
+        mode: "0640"
+      register: compose_file_copy
+
+    # Some stacks need a config file next to the compose file - a
+    # vendored upstream config the image would otherwise bake in, for
+    # instance. Named explicitly rather than copying the whole
+    # compose/<name>/ directory, so env.j2 is never shipped to a target
+    # by accident (it is a template, and the rendered .env below is the
+    # only form of it that should ever land on a host).
+    #
+    # Plain copy, not template: these are literal files. A stack that
+    # needs Jinja in one should get its own task rather than making this
+    # one guess.
+    #
+    # 0640, same as the compose file - readable by the deploy user and
+    # by docker, not world-readable. Anything SECRET belongs in env.j2,
+    # not here.
+    - name: "{{ stack.name }} | Copy extra files"
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../{{ stack.compose_src }}/{{ item }}"
+        dest: "{{ stack_path }}/{{ item }}"
+        mode: "0640"
+      loop: "{{ stack.extra_files | default([]) }}"
+      register: extra_files_copy
+
+    - name: "{{ stack.name }} | Render .env from vault-sourced secrets"
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../{{ stack.compose_src }}/env.j2"
+        dest: "{{ stack_path }}/.env"
+        mode: "0600"
+      when: stack.env_vault | default(false)
+
+    # pull: missing, not always. Every stack here pins an explicit tag,
+    # so re-pulling on each deploy would only re-check a digest that is
+    # already local - while making every deploy depend on the registry
+    # being up, registry.example.com included. Updating a service is therefore
+    # an explicit act: bump the tag in compose/<name>/docker-compose.yml.
+    #
+    # A stack deliberately left on a floating tag can override this with
+    # `pull: always` in its stacks entry.
+    # `files:` is not optional here. Left to auto-detection, docker
+    # compose scans the directory for compose.yaml / compose.yml /
+    # docker-compose.yaml / docker-compose.yml and picks by its own
+    # precedence - and several of these directories still contain the
+    # stack's ORIGINAL file under a different one of those names
+    # (/root/ghost/compose.yaml, /root/homepage/compose.yaml). The first
+    # deploy hit exactly that: docker reported "Found multiple config
+    # files ... Using /root/ghost/compose.yaml" and evaluated the old
+    # inline-secrets config instead of the one just copied, then
+    # reported "already up to date". Naming the file makes the run
+    # deterministic regardless of what else is in the directory.
+    #
+    # recreate defaults to "auto", which diffs the SERVICE DEFINITION
+    # (image, env, mount paths) against what's running - it has no way
+    # to know a bind-mounted file's CONTENT changed, only that a mount
+    # exists at the same path it always has. An extra_files edit (a
+    # bind-mounted Caddyfile, say) therefore updates the file on disk
+    # and leaves the running container on the old config, silently.
+    # This has bitten for real: the fix shipped to disk and the proxy
+    # kept serving the pre-fix config until someone force-recreated it
+    # by hand.
+    #
+    # Fix: force a full recreate on exactly the runs where our own copy
+    # tasks reported a change, extra_files included. `changed` on a
+    # looped task is true if ANY iteration changed, which is what we
+    # want - one changed file recreates the whole stack, same blast
+    # radius a docker-compose.yml edit already has. Every other run
+    # keeps `auto`, so an unrelated redeploy (a digest bump elsewhere)
+    # doesn't pay for a recreate it doesn't need.
+    - name: "{{ stack.name }} | Pull if needed and (re)create the stack"
+      community.docker.docker_compose_v2:
+        project_src: "{{ stack_path }}"
+        files:
+          - docker-compose.yml
+        pull: "{{ stack.pull | default('missing') }}"
+        state: present
+        remove_orphans: true
+        recreate: "{{ 'always' if (compose_file_copy.changed or extra_files_copy.changed | default(false)) else 'auto' }}"
+      register: compose_result
+
+    # A successful `docker compose up` only means the containers were
+    # created. It says nothing about whether they stayed up or passed
+    # their healthcheck - a stack here sat "unhealthy" for tens of
+    # thousands of consecutive checks while every deploy of it looked
+    # fine. Poll
+    # until every container in the project is running, and healthy
+    # wherever a healthcheck is defined.
+    #
+    # `starting` and `unhealthy` are both retried, so a slow starter
+    # gets its start_period and only a persistent failure fails the
+    # deploy. A stack that needs longer (GitLab allows 10m) can raise
+    # `health_retries` in its stacks entry.
+    #
+    # Uses the docker CLI rather than community.docker's
+    # docker_container_info, which reaches the API through the Python
+    # docker SDK and so needs `requests` on the target - the Alpine
+    # hosts don't have it, and that is exactly what aborted a host
+    # mid-deploy once already.
+    #
+    # {% raw %} because docker's --format is Go templating and would
+    # otherwise be eaten by Jinja.
+    - name: "{{ stack.name }} | Wait until containers are running and healthy"
+      ansible.builtin.shell: |
+        {% raw %}
+        ids=$(docker compose -f docker-compose.yml ps -q)
+        [ -n "$ids" ] || { echo "no containers in this project"; exit 1; }
+        out=$(docker inspect                 --format '{{.Name}} {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}'                 $ids)
+        echo "$out"
+        echo "$out" | awk '{
+          if ($2 != "running")                        bad = 1
+          if ($3 == "starting" || $3 == "unhealthy")  bad = 1
+        } END { exit bad + 0 }'
+        {% endraw %}
+      args:
+        chdir: "{{ stack_path }}"
+      register: stack_health
+      until: stack_health.rc == 0
+      retries: "{{ stack.health_retries | default(12) }}"
+      delay: 5
+      changed_when: false
+
+    - name: "{{ stack.name }} | Report result"
+      ansible.builtin.debug:
+        msg: >-
+          {{ stack.name }} ({{ stack_path }}):
+          {{ 'updated' if compose_result.changed else 'already up to date' }}
+          - {{ stack_health.stdout_lines | default([]) | length }} container(s) running/healthy
+
+    # Feeds playbooks/deploy.yml's end-of-run summary. Recorded here
+    # (not derived from the log afterwards) because this is the one
+    # place that already has compose_result and stack_health in scope.
+    # Accumulates across the loop in main.yml, one entry per stack.
+    #
+    # Only ever reached once this stack is already healthy - the task
+    # above has no rescue block, so an unhealthy stack fails its host's
+    # play right there and never records an entry here at all.
+    - name: "{{ stack.name }} | Record result for the end-of-run summary"
+      ansible.builtin.set_fact:
+        stack_results: >-
+          {{ (stack_results | default([])) + [{
+            'host': inventory_hostname,
+            'stack': stack.name,
+            'changed': compose_result.changed,
+            'containers': stack_health.stdout_lines | default([]) | length,
+          }] }}

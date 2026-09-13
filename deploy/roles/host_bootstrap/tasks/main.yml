@@ -1,0 +1,20 @@
+---
+# One-time preparation of a deploy target, split by concern so each
+# piece can be read (and re-run) on its own. Everything here is
+# idempotent.
+#
+# python.yml is deliberately NOT included here: it has to run in a
+# gather_facts: false play before any module needs an interpreter, so
+# playbooks/bootstrap.yml imports it as its own first play.
+
+- name: Create the deploy account
+  ansible.builtin.import_tasks: user.yml
+
+- name: Install the deploy account's SSH key
+  ansible.builtin.import_tasks: ssh_key.yml
+
+- name: Create the stack directories
+  ansible.builtin.import_tasks: directories.yml
+
+- name: Grant sudo where become-stacks need it
+  ansible.builtin.import_tasks: sudo.yml

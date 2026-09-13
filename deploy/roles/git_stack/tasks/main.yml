@@ -1,0 +1,78 @@
+---
+# Stacks deployed by checking out a git repo on the target and running
+# `docker compose up` inside it, rather than by copying a compose file
+# this repo owns (roles/docker_stack).
+#
+# Why a second role rather than an option on the first: docker_stack's
+# whole model is that THIS repo is the source of truth - it copies a
+# compose file and a rendered .env onto a host and forces a recreate
+# when either changes. That works when the deployable unit is "one
+# compose file plus maybe a config file or two".
+#
+# dashboard isn't shaped like that. Its compose file bind-mounts
+# config/ (the dashboard YAML, edited constantly), assets/,
+# nginx.conf.template, and a 154M vendored vendored-lib checkout, and
+# builds two of its services from source directories in the same tree.
+# Copying that into compose/dashboard/ would mean duplicating files that
+# are actively edited in their own repo - drift with no mechanism to
+# detect it. Pinning the repo to a commit and letting compose read the
+# tree in place keeps one source of truth and still makes the deployed
+# version explicit and reviewable: the pin lives in host_vars.
+#
+# What this role still owns, and docker_stack's reasons apply
+# unchanged: the .env. Those secrets otherwise exist in exactly one
+# place, on one host, with no backup and no record of what they are.
+#
+# Selection semantics (stack_filter, forbidden_stacks) are deliberately
+# identical to docker_stack's - a stack being git-shaped shouldn't
+# change how you target it from the command line.
+- name: Select which of this host's git stacks this run applies to
+  ansible.builtin.set_fact:
+    requested_git_stacks: >-
+      {{ (git_stacks | default([]))
+         if (stack_filter | default('') | length == 0)
+         else (git_stacks | default([])
+               | selectattr('name', 'in', stack_filter.split(','))
+               | list) }}
+    git_forbidden_list: "{{ (forbidden_stacks | default('')).split(',') | select | list }}"
+
+- name: Refuse a forbidden git stack that was asked for by name
+  ansible.builtin.fail:
+    msg: >-
+      Refusing to deploy stack '{{ item }}' on {{ inventory_hostname }}:
+      it is in forbidden_stacks ({{ forbidden_stacks }}).
+  loop: "{{ (stack_filter | default('')).split(',') | select | list }}"
+  when:
+    - git_forbidden_list | length > 0
+    - item in git_forbidden_list
+    - item in (git_stacks | default([]) | map(attribute='name') | list)
+
+- name: Drop forbidden git stacks from a broad selection
+  ansible.builtin.set_fact:
+    selected_git_stacks: "{{ requested_git_stacks | rejectattr('name', 'in', git_forbidden_list) | list }}"
+
+- name: Manage this host's git stacks
+  when: selected_git_stacks | length > 0
+  block:
+    # Same reasoning as docker_stack's equivalent: render every
+    # secret-bearing template on the controller before touching a
+    # single host, so a missing vault key fails before anything has
+    # been pulled or recreated rather than midway through.
+    - name: "Pre-flight: every env_vault template for this host renders"
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - (lookup('template', playbook_dir + '/../' + item.env_src + '/env.j2') | length) > 0
+        fail_msg: >-
+          {{ item.name }}: env.j2 could not be rendered - a vault key or
+          plain var it references is missing. Nothing has been deployed.
+      loop: "{{ selected_git_stacks | selectattr('env_vault', 'defined') | selectattr('env_vault') | list }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Deploy each selected git stack
+      ansible.builtin.include_tasks: stack.yml
+      loop: "{{ selected_git_stacks }}"
+      loop_control:
+        loop_var: stack
+        label: "{{ stack.name }}"

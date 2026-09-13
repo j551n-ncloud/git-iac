@@ -1,0 +1,116 @@
+# ANSIBLE MANAGED BLOCK below this header, inside markers - see
+# roles/gitlab_config for the mechanism (blockinfile + gitlab-ctl
+# reconfigure, run by playbooks/deploy_gitlab_config.yml). This file is
+# a Jinja2 template rendered on the CONTROLLER (vault access, like any
+# other env.j2 in this repo) - it never touches the target as a file of
+# its own; only its rendered content, wrapped in marker comments, gets
+# written into /DATA/gitlab/config/gitlab.rb.
+#
+# Reconciled against the LIVE gitlab.rb on tools on 2026-09-11 -
+# every line below reproduces something already active there
+# (`grep -vE '^\s*#|^\s*$' gitlab.rb`, then diffed by hand). Only
+# GITLAB_LOG_LEVEL at the bottom is genuinely new. mixlib-config (what
+# gitlab.rb is parsed with) takes the LAST assignment of any key, and
+# this block lands at the end of the file, so it doesn't need to touch
+# or remove gitlab.rb's older, pre-existing lines - they become
+# harmless duplicates, not conflicts.
+
+# Was gitlab_rails['registry_enabled'] = false already - the built-in
+# container registry has never been turned on. registry['log_level']
+# is set anyway (was already true on disk); harmless either way since
+# there's no registry process to produce log output.
+gitlab_rails['registry_enabled'] = false
+registry['log_level'] = "error"
+
+# gitlab-shell reachable at ssh.gitlab.example.com specifically (not just
+# gitlab.example.com) - matches the CNAME set up for git-over-SSH.
+gitlab_rails['gitlab_ssh_host'] = 'ssh.gitlab.example.com'
+
+# TLS termination in nginx itself, cert/key already present on disk at
+# these paths (inside /DATA/gitlab/config, which is bind-mounted as
+# /etc/gitlab - not something this repo provisions or rotates).
+# Mostly redundant with `external_url 'https://...'` (GitLab infers
+# https/443 from the URL scheme already) but kept explicit to match
+# exactly what was already active, rather than relying on inference.
+nginx['enable'] = true
+nginx['listen_port'] = 443
+nginx['listen_https'] = true
+nginx['redirect_http_to_https'] = false
+nginx['ssl_certificate']     = "/etc/gitlab/ssl/gitlab.example.com.crt"
+nginx['ssl_certificate_key'] = "/etc/gitlab/ssl/gitlab.example.com.key"
+
+# Outbound mail via Gmail SMTP, used for notifications and the
+# password-reset/account-confirmation flow.
+#
+# WARNING, found 2026-09-11: the value already on disk for this was
+# the literal placeholder string "<YOUR-NEW-GMAIL-APP-PASSWORD>" -
+# whoever set this up never actually filled in a real Gmail App
+# Password, so SMTP auth here has likely never worked. Moved into the
+# vault verbatim (vault_gitlab_smtp_password) rather than invented a
+# real one - put an actual app password there to fix mail, or leave it
+# as a placeholder if no one currently relies on email from this
+# instance. Either way it's now a deliberate choice, not a silent gap.
+gitlab_rails['smtp_enable'] = true
+gitlab_rails['smtp_address'] = "smtp.gmail.com"
+gitlab_rails['smtp_port'] = 465
+gitlab_rails['smtp_user_name'] = "mail@example.com"
+gitlab_rails['smtp_password'] = "{{ vault_gitlab_smtp_password }}"
+gitlab_rails['smtp_domain'] = "smtp.gmail.com"
+gitlab_rails['smtp_authentication'] = "login"
+gitlab_rails['smtp_enable_starttls_auto'] = false
+gitlab_rails['smtp_tls'] = true
+gitlab_rails['smtp_openssl_verify_mode'] = 'peer'
+gitlab_rails['gitlab_email_enabled'] = true
+gitlab_rails['gitlab_email_from'] = 'mail@example.com'
+gitlab_rails['gitlab_email_display_name'] = 'n-cloud'
+gitlab_rails['gitlab_email_reply_to'] = 'mail@example.com'
+
+# SSO via Pocket ID (auth.example.com), the same OIDC provider `auth` and
+# `pocketid` stacks run. Client secret was sitting in plaintext in
+# gitlab.rb on disk before this move; now in the vault
+# (vault_gitlab_oidc_client_secret). Rotating it isn't required
+# (nothing indicates it leaked beyond this host and this repo), but
+# it's now possible without hand-editing gitlab.rb again: change it in
+# Pocket ID, then in the vault.
+gitlab_rails['omniauth_enabled'] = true
+gitlab_rails['omniauth_allow_single_sign_on'] = ['openid_connect']
+gitlab_rails['omniauth_sync_email_from_provider'] = 'openid_connect'
+gitlab_rails['omniauth_sync_profile_from_provider'] = ['openid_connect']
+gitlab_rails['omniauth_sync_profile_attributes'] = ['email']
+gitlab_rails['omniauth_block_auto_created_users'] = false
+gitlab_rails['omniauth_providers'] = [
+  {
+    name: "openid_connect",
+    label: "Pocket ID",
+    icon: "https://auth.example.com/api/application-images/logo",
+    args: {
+      name: "openid_connect",
+      scope: ["openid", "profile", "email"],
+      response_type: "code",
+      issuer: "https://auth.example.com",
+      discovery: true,
+      client_auth_method: "query",
+      uid_field: "preferred_username",
+      send_scope_to_token_endpoint: "false",
+      pkce: true,
+      client_options: {
+        identifier: "4ed71da2-f670-48ea-a262-e2f3899c27aa",
+        secret: "{{ vault_gitlab_oidc_client_secret }}",
+        redirect_uri: "https://gitlab.example.com/users/auth/openid_connect/callback"
+      }
+    }
+  }
+]
+
+# Rails/Sidekiq's own info-level chatter was flooding the container's
+# combined log stream (what Portainer's log view shows) - measured 90s
+# of it on 2026-09-11: gitlab-rails alone accounted for more lines than
+# any other component. This does NOT touch nginx/workhorse's
+# per-request access logging (not severity-based, logs every request
+# regardless) - that's the other big chunk of the noise and has no
+# on/off switch in this GitLab version; read
+# /DATA/gitlab/logs/<service>/current directly for a single component
+# instead of the container's merged tail. This is the one genuinely NEW
+# setting in this whole file - everything above reproduces what was
+# already active.
+gitlab_rails['env'] = { 'GITLAB_LOG_LEVEL' => 'warn' }

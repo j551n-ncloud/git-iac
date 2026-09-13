@@ -1,0 +1,20 @@
+# Template for a production host's own stacks. Copy to
+# host_vars/<hostname>.yml (the exact name from inventory/hosts.ini,
+# e.g. host_vars/vaultwarden.yml) and fill in.
+#
+# A host with one service just needs one list entry (see the 12
+# single-stack hosts already scaffolded, e.g. host_vars/vaultwarden.yml).
+# A host running several services lists all of them here - the role
+# loops over however many entries there are.
+#
+# stacks:
+#   - name: vaultwarden
+#     compose_src: compose/vaultwarden
+#     path: /CHANGE-ME/vaultwarden   # wherever this already runs
+#     env_vault: true                # if it needs compose/vaultwarden/env.j2
+#
+#   - name: some-other-service-on-this-same-host
+#     compose_src: compose/some-other-service
+#     path: /CHANGE-ME/some-other-service
+#     pull: always                   # only if it tracks a floating tag;
+#                                    # the default is `missing`

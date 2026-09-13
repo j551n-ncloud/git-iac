@@ -1,0 +1,15 @@
+# Secrets for the `dashboard` git_stack (see inventory/host_vars/tools.yml).
+# Kept in its own file rather than vault.yml because a git_stack's .env
+# is mostly secrets - see compose/dashboard/env.j2.
+#
+# The real file is ansible-vault-encrypted and is NOT included in this
+# sanitized copy. Create it with:
+#   ansible-vault create inventory/group_vars/production/vault_dashboard.yml
+
+vault_dashboard_api_token: "CHANGE-ME"
+vault_dashboard_calendar_feed_url: "CHANGE-ME"
+vault_dashboard_digest_to: "CHANGE-ME"
+vault_dashboard_notify_topic: "CHANGE-ME"
+vault_dashboard_password_hash: "CHANGE-ME"
+vault_dashboard_secret_key: "CHANGE-ME"
+vault_dashboard_smtp_password: "CHANGE-ME"

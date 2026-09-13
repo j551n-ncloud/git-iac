@@ -1,0 +1,26 @@
+# The real inventory/group_vars/production/vault.yml is
+# ansible-vault-encrypted and is NOT included in this sanitized copy
+# (nor should it ever be committed unencrypted). This file documents
+# its shape: every vault_* key referenced by a compose/<stack>/env.j2
+# template in this repo, other than the dashboard git_stack's, which
+# has its own file (vault_dashboard.yml.example).
+#
+# Create the real file with:
+#   ansible-vault create inventory/group_vars/production/vault.yml
+#
+# and edit it with:
+#   ansible-vault edit inventory/group_vars/production/vault.yml
+
+vault_ghost_db_password: "CHANGE-ME"
+vault_ghost_mysql_root_password: "CHANGE-ME"
+vault_ghost_mail_password: "CHANGE-ME"
+
+vault_vaultwarden_admin_token: "CHANGE-ME"
+
+vault_pocketid_encryption_key: "CHANGE-ME"
+vault_pocketid_maxmind_license_key: "CHANGE-ME"
+
+# roles/gitlab_config renders these into gitlab.rb - see
+# compose/gitlab/gitlab-extra.rb.j2.
+vault_gitlab_smtp_password: "CHANGE-ME"
+vault_gitlab_oidc_client_secret: "CHANGE-ME"

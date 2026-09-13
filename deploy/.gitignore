@@ -1,0 +1,16 @@
+.vault_pass.txt
+.proxmox.json
+*.retry
+__pycache__/
+*.pyc
+.venv/
+*.log
+.venv-ansible/
+
+# Claude Code local settings - records the exact commands run in a
+# session, which here included host passwords in Bash permission rules.
+.claude/
+
+# CI cache dirs (cached by GitLab, must live inside the project dir)
+.ansible/
+.cache/

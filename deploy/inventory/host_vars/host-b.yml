@@ -1,0 +1,15 @@
+---
+stacks:
+  - name: vaultwarden
+    compose_src: compose/vaultwarden
+    env_vault: true
+    # No path: override - deploy_root's default (/opt/stacks/vaultwarden)
+    # is fine here since the compose file itself has no prior location
+    # to match; only the named volume (pinned in the compose file) has
+    # to line up, and it does.
+
+# Proxmox coordinates for the pre-deploy snapshot (roles/proxmox_snapshot).
+# Mirrors the comment in inventory/hosts.ini; kept as real vars because a
+# comment cannot be read by the role that needs it.
+proxmox_node: node-2
+proxmox_vmid: 201

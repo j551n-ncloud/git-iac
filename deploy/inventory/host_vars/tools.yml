@@ -1,0 +1,73 @@
+---
+# The host that runs the self-hosted GitLab, plus one git_stack. It is
+# the only host here that exercises both non-default roles, so it is
+# worth reading as the example of each.
+#
+# Deploy the gitlab stack with a LOCAL ansible run, never from a GitLab
+# CI job on this same GitLab. Recreating the container takes GitLab
+# down for minutes (its healthcheck allows a 10m start_period), which
+# would kill the very pipeline issuing the deploy. scripts/deploy_gitlab.sh
+# exists for exactly that.
+stacks:
+  - name: gitlab
+    compose_src: compose/gitlab
+    # The role's default gate (12 x 5s = 60s) is nowhere near enough
+    # for GitLab: its own healthcheck allows a 10m start_period, and
+    # a version bump adds database migrations on top of that. 180 x
+    # 5s = 15m, so a normal upgrade has room and a genuinely stuck
+    # one still fails the deploy instead of hanging forever.
+    health_retries: 180
+    # No path: override on purpose - compose derives its project name
+    # from the stack directory basename, and it must come out as
+    # "gitlab" to match the running container's labels. deploy_root's
+    # default gives /opt/stacks/gitlab, which is correct.
+    #
+    # No env_vault/extra_files here either: GITLAB_OMNIBUS_CONFIG can't
+    # reach an already-existing gitlab.rb in this image (see the header
+    # of compose/gitlab/docker-compose.yml), so SMTP/OIDC/nginx/log-level
+    # settings and their vault secrets are applied a different way:
+    # roles/gitlab_config renders compose/gitlab/gitlab-extra.rb.j2
+    # straight into the config directory, via
+    # playbooks/deploy_gitlab_config.yml - not the generic docker_stack
+    # role.
+
+# Stacks whose deployable unit is the whole git repo, not a compose
+# file this repo owns (roles/git_stack - its tasks/main.yml has the
+# reasoning for when a stack cannot be adopted as a normal one).
+#
+# This is the other half of the build pipeline: the build repo builds
+# this project's images, pushes them to the registry, and opens a merge
+# request here that moves `version:` below and the image pins in
+# compose_overlay. Merging deploys.
+git_stacks:
+  - name: dashboard
+    repo: git@github.com:example-org/dashboard.git
+    # An existing checkout, adopted in place rather than moved to
+    # deploy_root: the basename has to stay `dashboard` so the compose
+    # project name keeps matching the running containers' labels and
+    # the `dashboard_default` network that other stacks may join as
+    # external.
+    path: /data/dashboard
+    # Governs the CHECKOUT only - config, assets, templates. Image tags
+    # live in compose_overlay below.
+    version: 4f6d43ce2903bd20782e5f5a7e6cd832c7241909
+    # The checkout is root-owned.
+    become: true
+    # Renders compose/dashboard/env.j2 -> .env. Most of its keys are
+    # secrets that would otherwise exist only in that one file on that
+    # one host; they live in group_vars/production/vault_dashboard.yml.
+    env_vault: true
+    env_src: compose/dashboard
+    # Applied on top of the checkout's own compose file: pins the images
+    # so the target never builds, and is what check_image_updates.py
+    # reads.
+    compose_overlay: compose/dashboard/docker-compose.yml
+    # A pin move pulls a large image before anything starts; the role's
+    # default 12 x 5s would not cover it.
+    health_retries: 60
+
+# Proxmox coordinates for the pre-deploy snapshot (roles/proxmox_snapshot).
+# Mirrors the comment in inventory/hosts.ini; kept as real vars because a
+# comment cannot be read by the role that needs it.
+proxmox_node: node-2
+proxmox_vmid: 109

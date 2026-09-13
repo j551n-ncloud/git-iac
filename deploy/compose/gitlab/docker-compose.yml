@@ -1,0 +1,83 @@
+# Verified against the live container on tools (2026-09-04):
+# container_name, hostname, shm_size, restart policy, port bindings,
+# the three bind mounts, and the service key `web` all match what's
+# running.
+#
+# IMPORTANT, found 2026-09-11: GITLAB_OMNIBUS_CONFIG below is NOT
+# applied to an already-existing gitlab.rb by this image - confirmed by
+# reading /assets/init-container (this image's entrypoint) directly.
+# It only ever copies a bare template to gitlab.rb if that file doesn't
+# exist yet; nothing anywhere writes this env var's content into it
+# otherwise. tools's gitlab.rb has existed since before this repo
+# managed the stack, so GITLAB_OMNIBUS_CONFIG here only ever sets
+# external_url/letsencrypt/ssh_port on a genuinely first-ever deploy -
+# in practice, on this host, it does nothing at all. A first real
+# attempt at fixing this via `from_file(...)` here silently no-opped
+# for exactly this reason.
+#
+# Everything that actually needs to reach gitlab.rb - SMTP, the Pocket
+# ID OIDC integration, nginx TLS settings, GITLAB_LOG_LEVEL - is
+# instead managed directly in /DATA/gitlab/config/gitlab.rb by
+# roles/gitlab_config (a blockinfile + `gitlab-ctl reconfigure`, run by
+# playbooks/deploy_gitlab_config.yml via scripts/deploy_gitlab.sh). See
+# that role and compose/gitlab/gitlab-extra.rb.j2 for what's in it and
+# why. GITLAB_OMNIBUS_CONFIG is kept below anyway, harmless, in case
+# this ever deploys to a host where gitlab.rb genuinely doesn't exist
+# yet.
+#
+# Pinned at 19.3.1-ce.0, the newest CE release as of 2026-09-04,
+# upgraded from 19.2.5-ce.0. Changing this tag is an upgrade, not a
+# no-op recreate, so for the next bump:
+#
+#  * One minor step at a time, from the latest patch of the current
+#    minor - 19.2.5 -> 19.3.1 was exactly that, and needed no
+#    intermediate stop. Do not skip a minor or cross a major without
+#    checking GitLab's documented upgrade path for required stops.
+#  * Back up /DATA/gitlab first. Migrations run on start and there is
+#    no downgrade path once they have - a rollback means restoring the
+#    data, not re-pinning the old tag here.
+#  * Expect minutes of downtime while it migrates and reconfigures.
+#    19.2.5 -> 19.3.1 took about 3m40s to go healthy on tools, well
+#    past the role's 60s default gate, which is why the stacks entry
+#    in inventory/host_vars/tools.yml raises health_retries.
+#
+# Data lives in absolute bind mounts (/DATA/gitlab/*, ~5.9G), so it is
+# independent of where this compose file sits. Do not change those
+# paths without moving the data first.
+#
+# The compose project name must resolve to "gitlab" to match the
+# existing container's labels - that comes from the stack directory's
+# basename, so this stack must deploy to a directory named `gitlab`
+# (the deploy_root default, /opt/stacks/gitlab, does that). Deploying
+# it under a differently-named directory would make compose try to
+# create a second container called `gitlab` and fail on the name.
+services:
+  web:
+    image: gitlab/gitlab-ce:19.3.2-ce.0
+    container_name: gitlab
+    restart: unless-stopped
+    hostname: "gitlab.example.com"
+    shm_size: "256m"
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'https://gitlab.example.com'
+        letsencrypt['enable'] = false
+        gitlab_rails['gitlab_shell_ssh_port'] = 2224
+    ports:
+      - "443:443"
+      - "2224:22"
+    volumes:
+      - /DATA/gitlab/config:/etc/gitlab
+      - /DATA/gitlab/logs:/var/log/gitlab
+      - /DATA/gitlab/data:/var/opt/gitlab
+    healthcheck:
+      test: ["CMD-SHELL", "curl -kfsS https://localhost/-/readiness || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 6
+      start_period: 10m
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "1"

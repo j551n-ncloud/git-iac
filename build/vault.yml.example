@@ -1,0 +1,27 @@
+---
+# Backup record of this pipeline's secrets, encrypted at rest. Nothing
+# in .gitlab-ci.yml or scripts/ reads this file - the actual consumer
+# is always the matching CI/CD variable in Settings > CI/CD >
+# Variables. This exists so there's one canonical, encrypted copy
+# somewhere other than "only in GitLab's variable store".
+#
+# Copy to vault.yml (gitignored) and fill in with your own values.
+#
+# Decrypt: ansible-vault view vault.yml --vault-password-file <path>
+# Add a key: ansible-vault encrypt_string --stdin-name <key> --vault-password-file <path>
+#            (per-value encryption, like below - never requires
+#            decrypting the rest of this file to add to it)
+
+# The Harbor robot account the pipeline pushes with, scoped to a single
+# Harbor project, push+pull only. Mirrors HARBOR_ROBOT_TOKEN in this
+# project's CI/CD variables.
+#
+# Every secret the pipeline uses belongs here, not just this one. In
+# particular DEPLOY_API_TOKEN - the deploy-repo project access token
+# open_deploy_mr.py opens the compose-bump merge request with. A token
+# that exists only in a CI/CD variable store is exactly the
+# single-copy situation this file exists to avoid.
+vault_harbor_robot_token: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          00000000000000000000000000000000000000000000000000000000000000000000000000000000
+          0000000000000000000000000000000000000000000000000000000000000000000000000000000a

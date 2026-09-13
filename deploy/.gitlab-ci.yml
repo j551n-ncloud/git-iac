@@ -1,0 +1,585 @@
+---
+# Requires a self-hosted GitLab Runner with the "docker" executor,
+# tagged `docker` (adjust `tags:` below if yours differs).
+#
+# RUNNER PLACEMENT MATTERS: the runner must not live on a host this
+# pipeline deploys to. Recreating a stack on the runner's own host can
+# kill the job mid-run, and the GitLab instance itself runs on tools -
+# see FORBIDDEN_STACKS below.
+#
+# Required CI/CD variables (Settings > CI/CD > Variables), all scoped
+# to protected branches:
+#   SSH_PRIVATE_KEY         File type. Private half of the deploy key
+#                           whose public half is in
+#                           roles/host_bootstrap/defaults/main.yml.
+# There is no host-key variable and no committed known_hosts. Host key
+# verification is off (see ansible_ssh_common_args in
+# inventory/group_vars/all.yml), so the runner connects to whatever
+# answers on the inventory address without verifying it.
+#   ANSIBLE_VAULT_PASSWORD  Variable type, masked. Password protecting
+#                           inventory/group_vars/*/vault.yml.
+#   PROXMOX_API_URL         Variable type. e.g. https://192.0.2.x:8006
+#   PROXMOX_TOKEN_ID        Variable type. e.g. deploy@pve!ci
+#   PROXMOX_TOKEN_SECRET    Variable type, masked. The token's secret.
+#   GITLAB_API_TOKEN        Variable type, masked. Project access token
+#                           (Settings > Access Tokens), Developer role,
+#                           `api` scope. Used only by check-image-updates,
+#                           to open/update merge requests and issues -
+#                           CI_JOB_TOKEN returns 401 against this
+#                           instance's Issues API, so a real token is
+#                           required rather than the job token. `api`
+#                           scope covers the Commits/Branches/Merge
+#                           Requests calls too, no extra scope needed.
+#
+# The three PROXMOX_* variables exist because every deploy job takes a
+# Proxmox snapshot of each target before touching it. Deploy jobs check
+# all three before running the playbook and refuse to continue without
+# them: deploying without the rollback point is not a degraded mode
+# this pipeline offers.
+#
+# The configured token is root@pam!gitlab. Despite the prefix it is not
+# root-equivalent: privilege separation is on, so it holds only what its
+# ACL grants - VM.Snapshot and VM.Audit on the five managed vmids, and
+# nothing else in the cluster. Rollback (VM.Snapshot.Rollback) is
+# withheld on purpose. Adopting a new host needs a matching ACL entry or
+# its snapshot 403s and the deploy stops. See README.md.
+#
+# Because those are protected-branch scoped, they are NOT available on
+# merge request pipelines from unprotected branches. `lint` is
+# deliberately built to need none of them; `preflight` needs only the
+# vault password and so runs on the default branch only.
+#
+# There is also a scheduled pipeline (Settings > CI/CD > Schedules) that
+# runs `check-image-updates` daily against main, with a
+#   SCHEDULE_TASK   Variable type. Set to "check-image-updates".
+# CI/CD variable on the schedule itself (not a project-wide one) so the
+# job knows to run. Every other job below carries a
+# `$CI_PIPELINE_SOURCE == "schedule"` guard set to `when: never` FIRST,
+# ahead of its normal rules, precisely so this schedule can't also
+# trigger lint/preflight/deploy - see check-image-updates at the bottom
+# for what it actually does.
+
+stages:
+  - validate
+  - deploy
+  - check
+
+variables:
+  ANSIBLE_FORCE_COLOR: "1"
+  # GitLab's docker executor creates /builds world-writable, and Ansible
+  # refuses to load an ansible.cfg it finds in a world-writable
+  # directory. Without this the repo's ansible.cfg is silently ignored:
+  # roles_path is lost (role 'docker_stack' not found) and
+  # inventory_ignore_extensions is lost (the .ini inventory files get
+  # skipped and no hosts parse). Pointing ANSIBLE_CONFIG at it
+  # explicitly bypasses that discovery rule; before_script also tightens
+  # the directory permissions as a belt-and-braces measure.
+  ANSIBLE_CONFIG: "$CI_PROJECT_DIR/ansible.cfg"
+  # Stacks CI must never deploy, however it is invoked. `gitlab` is the
+  # GitLab instance running this very pipeline: recreating it takes the
+  # pipeline down with it. Deploy that one from a local run instead.
+  FORBIDDEN_STACKS: "gitlab"
+
+# Ansible only - no SSH, no vault. Safe on any pipeline, including MRs
+# from unprotected branches where the protected variables are absent.
+#
+# Image is ghcr.io/example-org/deploy-ci-image (source: the ci-image/
+# git submodule), which bakes in ansible-core, its collections, git and
+# openssh-client - everything this used to install fresh via
+# apt-get/pip every job. That install path is what kept hanging on this
+# runner: apt-get stuck on `git` and, separately, on `openssh-client`,
+# at different times, for no change in this repo. Pulling one pre-built
+# image instead of installing from scratch sidesteps that class of
+# failure entirely. Bump a pin by editing ci-image/Dockerfile, pushing
+# it (which publishes a new :latest via its own GitHub Actions), then
+# `git submodule update --remote` here.
+.ansible_base:
+  image: ghcr.io/example-org/deploy-ci-image:latest
+  tags:
+    - docker
+  before_script:
+    # See ANSIBLE_CONFIG above: drop group/other write so Ansible will
+    # trust the repo's ansible.cfg even by normal discovery.
+    - chmod go-w "$CI_PROJECT_DIR" || true
+    # Fail loudly if the config we depend on isn't actually in effect.
+    - |
+      ansible-config dump --only-changed | grep -q "DEFAULT_ROLES_PATH" || {
+        echo "ansible.cfg is not in effect - roles_path/inventory settings would be silently ignored." >&2
+        ansible-config dump --only-changed >&2
+        exit 1
+      }
+    # Prove the pinned versions are what's actually in use.
+    - ansible --version | head -1
+    - ansible-galaxy collection list 2>/dev/null | grep -E "community.docker|ansible.posix" || true
+
+# Adds the vault password. Needed by anything that reads group_vars.
+.ansible_vault:
+  extends: .ansible_base
+  before_script:
+    - !reference [.ansible_base, before_script]
+    - |
+      if [ -z "$ANSIBLE_VAULT_PASSWORD" ]; then
+        echo "ANSIBLE_VAULT_PASSWORD is empty - is this pipeline running on a protected branch?" >&2
+        exit 1
+      fi
+    - umask 077
+    - printf '%s' "$ANSIBLE_VAULT_PASSWORD" > .vault_pass.txt
+    # umask 077 would otherwise strip the execute bit off directories
+    # Ansible creates for its own temp files, which fails obscurely.
+    - umask 022
+  after_script:
+    - rm -f .vault_pass.txt ~/.ssh/deploy_key
+
+# Adds SSH. Needed only to actually reach hosts.
+.ansible_deploy:
+  extends: .ansible_vault
+  before_script:
+    - !reference [.ansible_vault, before_script]
+    # openssh-client is baked into the ci-image (see .ansible_base) -
+    # no install step needed here any more.
+    - ssh -V
+    - |
+      for v in SSH_PRIVATE_KEY; do
+        eval "val=\$$v"
+        if [ -z "$val" ]; then
+          echo "$v is empty - is this pipeline running on a protected branch?" >&2
+          exit 1
+        fi
+      done
+    - eval "$(ssh-agent -s)" >/dev/null
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    # Works whether the variable is File type (a path) or Variable type
+    # (raw content). `echo` supplies the trailing newline ssh-add needs.
+    #
+    # File-type variables are written by the runner with mode 0666, and
+    # ssh-add refuses a world-accessible private key outright
+    # ("UNPROTECTED PRIVATE KEY FILE ... This private key will be
+    # ignored"), so copy it to a 0600 file rather than adding it in
+    # place. `install -m` sets the mode as it creates the copy, so the
+    # key is never briefly readable at the new path.
+    - |
+      if [ -f "$SSH_PRIVATE_KEY" ]; then
+        install -m 600 "$SSH_PRIVATE_KEY" ~/.ssh/deploy_key
+        ssh-add ~/.ssh/deploy_key
+      else
+        echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+      fi
+    - ssh-add -l
+  # after_script REPLACES rather than extends the inherited one, so the
+  # vault cleanup has to be referenced back in explicitly.
+  after_script:
+    - !reference [.ansible_vault, after_script]
+    - rm -f .proxmox.json
+
+# Proxmox credentials for the pre-deploy snapshot, pulled into a deploy
+# job's script with `!reference [.proxmox_creds, script]`.
+#
+# Deliberately NOT in .ansible_deploy's before_script: auto-deploy runs
+# on every push to main and usually has nothing to do, and a job that
+# deploys nothing should not require credentials to start. Referencing
+# this after the "nothing changed" early exit means a no-op run stays
+# green on an instance where PROXMOX_* has not been configured, while
+# any run that will actually touch a container still refuses to start
+# without them.
+#
+# The credentials go into a 0600 file rather than onto the
+# ansible-playbook command line, where they would sit in the process
+# list for anything sharing this container. Built with json.dumps so a
+# secret containing a quote or backslash cannot break out of the file.
+.proxmox_creds:
+  script:
+    - |
+      for v in PROXMOX_API_URL PROXMOX_TOKEN_ID PROXMOX_TOKEN_SECRET; do
+        eval "val=\$$v"
+        if [ -z "$val" ]; then
+          echo "$v is empty - the pre-deploy snapshot cannot run without it." >&2
+          echo "See 'Set GitLab CI/CD variables' in README.md." >&2
+          exit 1
+        fi
+      done
+      umask 077
+      python3 - > .proxmox.json <<'PYEOF'
+      import json, os
+      print(json.dumps({
+          "proxmox_api_url": os.environ["PROXMOX_API_URL"],
+          "proxmox_api_token_id": os.environ["PROXMOX_TOKEN_ID"],
+          "proxmox_api_token_secret": os.environ["PROXMOX_TOKEN_SECRET"],
+      }))
+      PYEOF
+      umask 022
+
+# --- validate ---------------------------------------------------------
+
+# Syntax only: no inventory hosts needed, no vault, no SSH. Note there
+# is no `--limit` here on purpose - `--limit` against a group with no
+# hosts is a hard error ("leaves us with no hosts to target"), which is
+# exactly how the previous version of this file failed every run.
+lint:
+  extends: .ansible_base
+  stage: validate
+  script:
+    - ansible-playbook -i inventory/ playbooks/deploy.yml --syntax-check
+    - ansible-playbook -i inventory/ playbooks/bootstrap.yml --syntax-check
+    - ansible-playbook -i inventory/ playbooks/preflight.yml --syntax-check
+    - ansible-playbook -i inventory/ playbooks/fleet_report.yml --syntax-check
+    - ansible-inventory -i inventory/ --graph
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+# Validates every compose file in the repo actually parses. Runs in a
+# docker image purely for the compose binary - `docker compose config`
+# resolves and validates the file without contacting a daemon, so no
+# socket is mounted and this cannot touch anything.
+#
+# --no-interpolate on purpose: the ${VARS} in these files come from a
+# rendered .env that only exists on the target, and their values are
+# irrelevant to whether the file is well-formed.
+#
+# Verified to exit 1 on both malformed YAML and an unknown key, so this
+# is a real gate rather than a no-op.
+compose-lint:
+  stage: validate
+  image: docker:cli
+  tags:
+    - docker
+  script:
+    - |
+      fail=0
+      for f in compose/*/docker-compose.yml; do
+        if docker compose -f "$f" --project-directory "$(dirname "$f")" \
+             config -q --no-interpolate 2>/tmp/err; then
+          echo "ok    $f"
+        else
+          echo "FAIL  $f"
+          sed 's/^/        /' /tmp/err
+          fail=1
+        fi
+      done
+      exit $fail
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+# Asserts the inventory and vars actually resolve and that every stack's
+# compose file and secret template are present and render. Catches the
+# silent class of failure where vars go missing and every host is
+# skipped while the run still exits 0.
+preflight:
+  extends: .ansible_vault
+  stage: validate
+  script:
+    - ansible-playbook -i inventory/ playbooks/preflight.yml --vault-password-file .vault_pass.txt
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+# Works out what this push actually changed, so auto-deploy can touch
+# only the affected stacks instead of recreating the whole fleet.
+#
+# Emits a dotenv artifact with AUTO_STACKS and AUTO_HOSTS, which GitLab
+# injects as variables into the auto-deploy job below. Both are empty
+# when nothing deployable changed, and auto-deploy exits early on that.
+#
+# GIT_DEPTH: 0 because the default shallow clone (20 commits) will not
+# contain CI_COMMIT_BEFORE_SHA after a quiet week, and `git diff`
+# against a commit the clone lacks fails rather than falling back.
+detect-changes:
+  extends: .ansible_vault
+  stage: validate
+  variables:
+    GIT_DEPTH: 0
+  script:
+    # git is baked into the ci-image (see .ansible_base) - no install
+    # step needed here any more.
+    - |
+      set -eu
+      # CI_COMMIT_BEFORE_SHA is all-zeros on the first push to a branch,
+      # and stale after a force push. Fall back to the commit's own
+      # parent, which is what "what did this push change" means anyway.
+      base="${CI_COMMIT_BEFORE_SHA:-}"
+      case "$base" in
+        ''|0000000000000000000000000000000000000000) base="" ;;
+      esac
+      if [ -n "$base" ] && git cat-file -e "${base}^{commit}" 2>/dev/null; then
+        range="${base}..${CI_COMMIT_SHA}"
+      else
+        range="${CI_COMMIT_SHA}~1..${CI_COMMIT_SHA}"
+      fi
+      echo "diff range: $range"
+      git diff --name-only "$range" > changed.txt
+      sed 's/^/  /' changed.txt
+      # Each `- |` below is its own shell, so the base ref has to be
+      # handed over in a file rather than an env var.
+      printf '%s' "${range%%..*}" > diff_base.txt
+    - |
+      set -eu
+      # A change under roles/, playbooks/ or group_vars/ can alter how
+      # EVERY stack deploys. Auto-deploying the whole fleet off a role
+      # tweak is exactly the blast radius this job exists to avoid, so
+      # it deploys nothing and defers to the manual job.
+      if grep -qE '^(roles/|playbooks/|inventory/group_vars/)' changed.txt; then
+        echo "shared deploy logic changed - not auto-deploying."
+        echo "review it and run the manual 'deploy' job when you are ready."
+        : > stacks.txt
+        : > git_stacks.txt
+      else
+        sed -n 's#^compose/\([^/]*\)/.*#\1#p' changed.txt | sort -u > stacks.txt
+        # A git stack (roles/git_stack) is pinned by a `version:` in
+        # host_vars, not by a compose file, so the sed above can never
+        # see one - merging a pin bump used to deploy nothing at all.
+        # The script compares the pinned commit before and after rather
+        # than grepping the diff, so a comment edit in the same file
+        # doesn't redeploy anything.
+        python3 scripts/changed_git_stacks.py "$(cat diff_base.txt)" > git_stacks.txt
+      fi
+      echo "changed stacks: $(tr '\n' ' ' < stacks.txt)"
+      echo "changed git stacks: $(cut -f2 git_stacks.txt | tr '\n' ' ')"
+    - |
+      set -eu
+      # Map stack -> host from the inventory itself rather than a second
+      # hand-maintained list. Drops anything in FORBIDDEN_STACKS here as
+      # well as in the role, so a forbidden stack never even reaches the
+      # deploy job's --limit.
+      ansible-inventory -i inventory/ --list \
+        --vault-password-file .vault_pass.txt > inventory.json
+      python3 - <<'EOF' > deploy.env
+      import json, os, sys
+
+      inv = json.load(open("inventory.json"))
+      hostvars = inv.get("_meta", {}).get("hostvars", {})
+      changed = {s.strip() for s in open("stacks.txt") if s.strip()}
+      forbidden = {s for s in os.environ.get("FORBIDDEN_STACKS", "").split(",") if s}
+
+      # Both kinds by name: a git stack has a compose overlay in this
+      # repo too (compose/<name>/), so a change there is a change to that
+      # stack exactly as it is for a docker_stack.
+      stacks, hosts = set(), set()
+      for host, v in hostvars.items():
+          for key in ("stacks", "git_stacks"):
+              for stack in v.get(key) or []:
+                  name = stack.get("name")
+                  if name in changed and name not in forbidden:
+                      stacks.add(name)
+                      hosts.add(host)
+
+      # A moved pin arrives already paired with its host, since it lives
+      # in that host's own host_vars file.
+      if os.path.exists("git_stacks.txt"):
+          for line in open("git_stacks.txt"):
+              if "\t" not in line:
+                  continue
+              host, name = line.rstrip("\n").split("\t", 1)
+              changed.add(name)
+              if name not in forbidden:
+                  stacks.add(name)
+                  hosts.add(host)
+
+      # stderr, NOT stdout: this file is a dotenv artifact and GitLab
+      # rejects the whole upload as "Invalid Format" if it contains a
+      # comment line, failing the job over a note nobody needed.
+      skipped = sorted(changed & forbidden)
+      if skipped:
+          print(f"forbidden, not auto-deployed: {', '.join(skipped)}", file=sys.stderr)
+      orphans = sorted(changed - stacks - forbidden)
+      if orphans:
+          print(f"changed but not in any host's stacks: {', '.join(orphans)}", file=sys.stderr)
+
+      print(f"AUTO_STACKS={','.join(sorted(stacks))}")
+      print(f"AUTO_HOSTS={','.join(sorted(hosts))}")
+      EOF
+      cat deploy.env
+  artifacts:
+    reports:
+      dotenv: deploy.env
+    expire_in: 1 week
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+# --- deploy -----------------------------------------------------------
+
+# Manual and explicitly scoped. DEPLOY_LIMIT and STACK_FILTER are meant
+# to be set when triggering the job (Run pipeline > Variables, or edit
+# them here for a one-off):
+#
+#   DEPLOY_LIMIT=host-a STACK_FILTER=homepage   one stack, one host
+#   DEPLOY_LIMIT=host-b                          every stack on one host
+#   DEPLOY_LIMIT=managed                         every managed stack (default)
+#
+# Use `managed`, not `production`: a play connects to and gathers facts
+# on every host in scope, and several production hosts have no stacks
+# and are not bootstrapped, so targeting the whole group fails on
+# unreachable hosts for no benefit. inventory/hosts.ini defines
+# [managed], and preflight asserts it matches the hosts with stacks.
+#
+# Deploying a whole group at once recreates every managed container on
+# every host in it. That is rarely what you want - prefer narrowing it.
+#
+# resource_group serialises deploys so two pipelines can't run Ansible
+# against the same hosts concurrently and race docker compose.
+deploy:
+  extends: .ansible_deploy
+  stage: deploy
+  environment:
+    name: production
+  resource_group: production
+  variables:
+    DEPLOY_LIMIT: "managed"
+    STACK_FILTER: ""
+  script:
+    - !reference [.proxmox_creds, script]
+    - |
+      echo "limit=$DEPLOY_LIMIT stack_filter=${STACK_FILTER:-<all>} forbidden=$FORBIDDEN_STACKS"
+      ansible-playbook -i inventory/ \
+        --limit "$DEPLOY_LIMIT" \
+        playbooks/deploy.yml \
+        -e "stack_filter=$STACK_FILTER" \
+        -e "forbidden_stacks=$FORBIDDEN_STACKS" \
+        -e snapshot_before_deploy=true \
+        -e @.proxmox.json \
+        --vault-password-file .vault_pass.txt
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+  # No `needs:` on a staging job. There are no staging hosts, so such a
+  # job could only ever be a no-op (or a hard error), and gating
+  # production behind it would be false confidence rather than a test.
+  needs:
+    - lint
+    - compose-lint
+    - preflight
+
+# Automatic counterpart to the job above: runs on every push to the
+# default branch and deploys ONLY the stacks that push changed, as
+# worked out by detect-changes. A README-only commit deploys nothing.
+#
+# Same resource_group as the manual job, so the two serialise against
+# each other and cannot race docker compose on the same host.
+#
+# Deliberately NOT `when: manual`. That is the point of this job - but
+# it also means a bad compose file on main reaches production without a
+# human in the loop, which is why lint, compose-lint and preflight are
+# all in `needs` and why every target is snapshotted first.
+auto-deploy:
+  extends: .ansible_deploy
+  stage: deploy
+  environment:
+    name: production
+  resource_group: production
+  script:
+    - |
+      set -eu
+      if [ -z "${AUTO_STACKS:-}" ]; then
+        echo "no deployable stack changes in this push - nothing to do."
+        exit 0
+      fi
+    - !reference [.proxmox_creds, script]
+    - |
+      echo "limit=$AUTO_HOSTS stack_filter=$AUTO_STACKS forbidden=$FORBIDDEN_STACKS"
+      ansible-playbook -i inventory/ \
+        --limit "$AUTO_HOSTS" \
+        playbooks/deploy.yml \
+        -e "stack_filter=$AUTO_STACKS" \
+        -e "forbidden_stacks=$FORBIDDEN_STACKS" \
+        -e snapshot_before_deploy=true \
+        -e @.proxmox.json \
+        --vault-password-file .vault_pass.txt
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  needs:
+    - lint
+    - compose-lint
+    - preflight
+    - detect-changes
+
+# --- check --------------------------------------------------------------
+
+# Scans every compose file for images with a newer stable tag available
+# upstream. A plain tag-pinned image gets a merge request with the bump
+# already applied, one per stack - merging it is the whole action, and
+# (like any other compose change on main) redeploys that stack right
+# away. A digest-pinned image (auth, for instance - pinned that way on
+# purpose, with a comment explaining why a routine bump doesn't apply)
+# only ever gets an issue, never a one-click MR.
+# Runs only from the "check-image-updates" pipeline schedule (Settings >
+# CI/CD > Schedules, SCHEDULE_TASK=check-image-updates, cron e.g.
+# "0 6 * * *") - never from a push or MR. Every job above carries a
+# `$CI_PIPELINE_SOURCE == "schedule"` guard so this schedule can't
+# accidentally also run lint/preflight/deploy.
+#
+# Talks to this project's own API with GITLAB_API_TOKEN (see the
+# required-variables list at the top of this file). CI_JOB_TOKEN was
+# tried first as the simpler option, but this instance returns 401 for
+# it against the Issues API, so a real project access token is needed.
+#
+# Never runs ansible-playbook or touches a host directly - anything it
+# does lands as a commit on an image-update/<stack> branch or an issue,
+# both labelled "image-update". Actually reaching production still goes
+# through a human merging that MR, same as any other change.
+check-image-updates:
+  stage: check
+  # requests is already in the ci-image (see .ansible_base) - this job
+  # doesn't need ansible itself, but reuses the same image rather than
+  # installing requests fresh in a plain python:3.12-slim.
+  image: ghcr.io/example-org/deploy-ci-image:latest
+  tags:
+    - docker
+  script:
+    - python3 scripts/check_image_updates.py
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_TASK == "check-image-updates"'
+
+# Read-only. Lists every Proxmox snapshot per managed host (not just the
+# ones roles/proxmox_snapshot manages) and every host's docker disk
+# usage, including which images no running container references anymore
+# - what `docker image prune -a` would additionally reclaim that the
+# routine dangling-only prune (roles/docker_stack) leaves alone. Never
+# deletes anything - see playbooks/fleet_report.yml.
+#
+# Used rarely - only when disk space or old-snapshot buildup is
+# actually a question - so unlike `deploy` it deliberately does NOT
+# show up as a manual button on every ordinary push. It only exists in
+# a pipeline at all when triggered with RUN_FLEET_REPORT=true set (Run
+# pipeline > Variables, or the API's `variables` on pipeline creation).
+# DEPLOY_LIMIT narrows it the same way deploy's does; defaults to every
+# managed host.
+fleet-report:
+  extends: .ansible_deploy
+  stage: check
+  variables:
+    DEPLOY_LIMIT: "managed"
+  script:
+    - !reference [.proxmox_creds, script]
+    - |
+      ansible-playbook -i inventory/ \
+        --limit "$DEPLOY_LIMIT" \
+        playbooks/fleet_report.yml \
+        -e @.proxmox.json \
+        --vault-password-file .vault_pass.txt
+  rules:
+    - if: '$RUN_FLEET_REPORT == "true"'
+  needs:
+    - lint
+    - compose-lint
+    - preflight
+
+# adhoc (arbitrary shell command on any host via SSH, no laptop access
+# needed) existed here briefly on 2026-09-10/11 and was deliberately
+# removed: it ran ANY command as the deploy user - root-equivalent on
+# every host with a become: true stack - triggered by nothing more than
+# a pipeline variable, with no reviewable diff first the way a compose
+# change has. That's a materially bigger, less-audited blast radius than
+# the rest of this pipeline intentionally has. If something like it
+# comes back, scope it to a fixed menu of safe read-only operations
+# rather than a free-form shell string.

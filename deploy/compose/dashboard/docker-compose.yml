@@ -1,0 +1,31 @@
+---
+# Deploy-time overlay for the dashboard git_stack, applied on top of the
+# checkout's own (development) compose file - later -f wins, so these
+# pins override its `build:` stanzas and the target never builds.
+#
+# Only the pins live here; everything else stays upstream.
+#
+# Plain YAML named docker-compose.yml on purpose: check_image_updates.py
+# scans compose/*/docker-compose.yml for `image:` lines, so this is also
+# what makes these images visible to the daily update check.
+services:
+  # Built by the companion build pipeline and tagged with the dashboard
+  # commit they were built from, so these track the `version` pin in
+  # inventory/host_vars/tools.yml. Not version-shaped, so the daily
+  # update check leaves them alone - the build pipeline's own merge
+  # request is what bumps them.
+  api:
+    image: registry.example.com/library/dashboard-api:4f6d43c
+    pull_policy: always
+
+  worker:
+    image: registry.example.com/library/dashboard-worker:4f6d43c
+    pull_policy: always
+
+  # A third-party image, version-shaped, so the daily check does offer
+  # bumps for this one. The contrast with the two above is the point:
+  # which images this repo bumps, and which the build pipeline bumps,
+  # is decided by the shape of the tag.
+  cache:
+    image: docker.io/library/redis:7.4.1
+    pull_policy: always

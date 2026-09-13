@@ -1,0 +1,87 @@
+---
+# Snapshot every target before touching it. Its own play, on purpose:
+# every host in scope is snapshotted and verified before the first
+# container anywhere is recreated, so a storage backend that cannot
+# snapshot stops the run while the fleet is still untouched. Folding
+# this into the deploy play as a pre_task would instead snapshot and
+# deploy host by host, leaving earlier hosts already changed when a
+# later one fails.
+#
+# connection: local because this talks to the Proxmox API from the
+# controller, not to the target over SSH. gather_facts is off for the
+# same reason: nothing here needs facts, and gathering them would mean
+# SSHing to a host we have not snapshotted yet.
+#
+# Off unless asked for. CI turns it on; a local run opts in with
+# -e snapshot_before_deploy=true.
+- name: Snapshot targets before deploying
+  hosts: all
+  gather_facts: false
+  connection: local
+  tasks:
+    - name: Take a pre-deploy Proxmox snapshot
+      ansible.builtin.include_role:
+        name: proxmox_snapshot
+      when: snapshot_before_deploy | default(false) | bool
+
+# Routine deploy/update run. No `become`, the deploy user is expected
+# to already own {{ deploy_root }} and belong to the docker group
+# (set up once via playbooks/bootstrap.yml). Keeping this play
+# unprivileged means the CI job's SSH key only ever needs the access
+# of a normal, non-root user.
+- name: Update docker compose stacks
+  hosts: all
+  gather_facts: true
+  roles:
+    - docker_stack
+    # Stacks whose deployable unit is a whole git repo rather than a
+    # compose file this repo owns - see roles/git_stack/tasks/main.yml
+    # for why that needed a role of its own. Both roles feed the same
+    # stack_results fact, so the summary play below covers either kind.
+    - git_stack
+
+# One consolidated report at the end, so the outcome of a multi-host,
+# multi-stack run doesn't have to be pieced together by scrolling back
+# through per-stack log lines. Doesn't replace those - each stack's own
+# "Report result" task (roles/docker_stack/tasks/stack.yml) still logs
+# as it goes, which is what you have to go on if a run fails partway
+# and this summary never gets to run.
+#
+# connection: local + run_once: true: this needs no host access at all,
+# just the stack_results fact every host already set for itself in the
+# previous play - hostvars keeps those in memory for the rest of this
+# ansible-playbook run regardless of which host "runs" this task.
+- name: Deploy summary
+  hosts: all
+  connection: local
+  gather_facts: false
+  run_once: true
+  tasks:
+    - name: Collect every host's stack results
+      ansible.builtin.set_fact:
+        all_results: >-
+          {{ hostvars.values()
+             | map(attribute='stack_results', default=[])
+             | sum(start=[]) }}
+
+    - name: Report nothing to summarise
+      ansible.builtin.debug:
+        msg: "Deploy summary: no stacks were deployed this run."
+      when: all_results | length == 0
+
+    # Every entry here is already healthy by construction: the health-wait
+    # task above (roles/docker_stack/tasks/stack.yml) has no rescue block,
+    # so a stack that never came up healthy fails its host's play outright
+    # and never reaches "Record result" - it shows up as a failed task and
+    # a nonzero PLAY RECAP for that host instead, not a row here. This is
+    # a summary of what went well, not a substitute for that failure.
+    - name: Print the deploy summary
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.host }}/{{ item.stack }}:
+          {{ 'updated' if item.changed else 'unchanged' }}
+          - {{ item.containers }} container(s) running/healthy
+      loop: "{{ all_results }}"
+      loop_control:
+        label: "{{ item.host }}/{{ item.stack }}"
+      when: all_results | length > 0

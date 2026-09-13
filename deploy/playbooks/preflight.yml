@@ -1,0 +1,244 @@
+---
+# Repo/inventory sanity checks. No SSH, no hosts touched
+# (connection: local), so this is safe to run anywhere - but it DOES
+# read group_vars, so it needs the vault password.
+#
+#   ansible-playbook -i inventory/ playbooks/preflight.yml \
+#     --vault-password-file .vault_pass.txt
+#
+# This exists because the failure mode it checks for is silent: when
+# group_vars/ sat at the repo root instead of inside inventory/, every
+# variable came back undefined, every host was skipped as "no stacks
+# defined", and the run still exited 0. A green pipeline proved
+# nothing. These assertions turn that class of mistake into a failure.
+#
+# `quiet: true` on the asserts keeps the output to failures only.
+# Nothing here prints rendered template content, so no no_log is
+# needed - and leaving it off means a failure actually names the
+# missing variable instead of showing "censored".
+- name: Pre-flight checks
+  hosts: all
+  gather_facts: false
+  connection: local
+
+  vars:
+    # This play runs on the controller, not the targets, so any module
+    # it uses needs the interpreter that is running ansible-playbook -
+    # NOT the /usr/bin/python3 that group_vars/all.yml sets for the
+    # managed hosts. In the CI image python is at
+    # /usr/local/bin/python3, so inheriting the target value makes
+    # every module here fail with "/usr/bin/python3: not found".
+    # (It passed on macOS only because /usr/bin/python3 exists there.)
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+  tasks:
+    - name: Core vars from group_vars must actually be loaded
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - deploy_root is defined
+          - deploy_user is defined
+          - ansible_user is defined
+        fail_msg: >-
+          {{ inventory_hostname }}: core vars missing. group_vars/ and
+          host_vars/ must live INSIDE inventory/ - at the repo root
+          Ansible silently ignores them during playbook runs.
+
+    - name: Every host must define stacks (an empty list is fine and explicit)
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - stacks is defined
+          - stacks is iterable
+        fail_msg: >-
+          {{ inventory_hostname }}: `stacks` is undefined. Give it an
+          explicit `stacks: []` in
+          inventory/host_vars/{{ inventory_hostname }}.yml if this host
+          isn't managed here, so it reads as a decision, not an accident.
+
+    - name: Each stack must be well-formed
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - item.name is defined
+          - item.compose_src is defined
+        fail_msg: "{{ inventory_hostname }}: malformed stack entry {{ item }}"
+      loop: "{{ stacks | default([]) }}"
+      loop_control:
+        label: "{{ item.name | default('<unnamed>') }}"
+
+    - name: Locate each stack's compose file in this repo
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../{{ item.compose_src }}/docker-compose.yml"
+      register: compose_stat
+      loop: "{{ stacks | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Every stack's compose file must exist
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - item.stat.exists
+        fail_msg: >-
+          {{ inventory_hostname }}: stack '{{ item.item.name }}' points at
+          {{ item.item.compose_src }}/docker-compose.yml, which does not
+          exist in this repo.
+      loop: "{{ compose_stat.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    # extra_files are copied by roles/docker_stack, which would fail
+    # mid-deploy - after the stack directory exists and possibly after
+    # other stacks on this host have already been recreated. Catch a
+    # typo or a file that was never committed here instead.
+    #
+    # subelements pairs each stack with each of its extra_files, so
+    # item.0 is the stack and item.1 the filename.
+    - name: Locate each stack's extra_files in this repo
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../{{ item.0.compose_src }}/{{ item.1 }}"
+      register: extra_files_stat
+      loop: "{{ stacks | default([]) | selectattr('extra_files', 'defined') | list | subelements('extra_files') }}"
+      loop_control:
+        label: "{{ item.0.name }}: {{ item.1 }}"
+
+    - name: Every extra_files entry must exist
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - item.stat.exists
+        fail_msg: >-
+          {{ inventory_hostname }}: stack '{{ item.item.0.name }}' lists
+          extra_files entry '{{ item.item.1 }}', which does not exist at
+          {{ item.item.0.compose_src }}/{{ item.item.1 }} in this repo.
+      loop: "{{ extra_files_stat.results }}"
+      loop_control:
+        label: "{{ item.item.0.name }}: {{ item.item.1 }}"
+
+    # lookup('template') renders on the controller with this host's
+    # vars and raises on an undefined variable, so this catches a
+    # missing vault key before any deploy touches a container. The
+    # assertion only checks that output exists - it never echoes it.
+    - name: A stack with env_vault must have an env.j2 that renders
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - (lookup('template', playbook_dir + '/../' + item.compose_src + '/env.j2') | length) > 0
+        fail_msg: >-
+          {{ inventory_hostname }}: stack '{{ item.name }}' sets env_vault
+          but its env.j2 did not render - a vault key or plain var it
+          references is missing.
+      loop: "{{ stacks | default([]) | selectattr('env_vault', 'defined') | selectattr('env_vault') | list }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # git_stacks (roles/git_stack) - same three checks as above, but the
+    # entries are shaped differently enough to need their own tasks:
+    # there is no compose_src or extra_files, the env template lives at
+    # env_src, and `version` has no default because a git stack with no
+    # pin is exactly the drift this repo exists to prevent.
+    - name: Each git stack must be well-formed
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - item.name is defined
+          - item.repo is defined
+          - item.version is defined
+        fail_msg: >-
+          {{ inventory_hostname }}: malformed git_stacks entry {{ item }} -
+          name, repo and version (a commit SHA, not a branch) are all
+          required.
+      loop: "{{ git_stacks | default([]) }}"
+      loop_control:
+        label: "{{ item.name | default('<unnamed>') }}"
+
+    - name: A git stack with env_vault must have an env.j2 that renders
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - (lookup('template', playbook_dir + '/../' + item.env_src + '/env.j2') | length) > 0
+        fail_msg: >-
+          {{ inventory_hostname }}: git stack '{{ item.name }}' sets
+          env_vault but {{ item.env_src }}/env.j2 did not render - a vault
+          key or plain var it references is missing.
+      loop: "{{ git_stacks | default([]) | selectattr('env_vault', 'defined') | selectattr('env_vault') | list }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: "A custom path: must be absolute"
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - item.path is match('/')
+        fail_msg: >-
+          {{ inventory_hostname }}: stack '{{ item.name }}' has a
+          non-absolute path: {{ item.path }}
+      loop: >-
+        {{ ((stacks | default([])) + (git_stacks | default([])))
+           | selectattr('path', 'defined') | list }}
+      loop_control:
+        label: "{{ item.name }}"
+
+    # Keeps inventory/hosts.ini's [managed] group honest. Deploys target
+    # that group, so a host with stacks left out of it would never be
+    # deployed, and a host in it without stacks would be connected to
+    # (and fact-gathered) for nothing - failing the run if it isn't
+    # bootstrapped.
+    - name: "[managed] must contain exactly the hosts that define stacks"
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - (inventory_hostname in groups['managed'])
+            == (((stacks | default([])) + (git_stacks | default([]))) | length > 0)
+        fail_msg: >-
+          {{ inventory_hostname }}:
+          {{ 'has stacks but is NOT in the [managed] group, so it would never be deployed'
+             if ((stacks | default([])) + (git_stacks | default([]))) | length > 0
+             else 'is in [managed] but defines no stacks, so deploys would connect to it for nothing' }}
+          - fix inventory/hosts.ini.
+
+
+    # The single most dangerous invariant in this repo, and until now it
+    # lived only in a comment. docker compose derives the PROJECT NAME
+    # from the stack directory's basename, and the project name is what
+    # prefixes volume and network names: project "vaultwarden" +
+    # volume "data" is what resolves to the existing
+    # vaultwarden_data. Deploy that stack to a directory with any
+    # other basename and compose silently creates NEW EMPTY volumes -
+    # which presents as data loss.
+    #
+    # Every adopted stack currently satisfies basename == stack.name, so
+    # assert it rather than trusting anyone to read the comment.
+    #
+    # git_stacks is in the same loop because the risk is identical
+    # there, and can be worse than losing volumes: another stack may
+    # join `dashboard_default` as an external network, so a checkout
+    # whose basename stopped being `dashboard` would leave that stack
+    # unable to start at all.
+    - name: A stack's directory basename must equal its name (compose project name)
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - (item.path | default(deploy_root ~ '/' ~ item.name) | basename) == item.name
+        fail_msg: >-
+          {{ inventory_hostname }}: stack '{{ item.name }}' would deploy to
+          {{ item.path | default(deploy_root ~ '/' ~ item.name) }}, whose
+          basename is
+          '{{ item.path | default(deploy_root ~ '/' ~ item.name) | basename }}'.
+          docker compose would then use that as the project name, so this
+          stack's volumes and networks would resolve to
+          '{{ item.path | default(deploy_root ~ '/' ~ item.name) | basename }}_*'
+          instead of '{{ item.name }}_*' - creating new empty volumes
+          rather than reusing the existing data. Either rename the stack
+          or point path: at a directory named '{{ item.name }}'.
+      loop: "{{ (stacks | default([])) + (git_stacks | default([])) }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: OK -
+          {{ ((stacks | default([])) + (git_stacks | default([]))) | length }} stack(s)
+          {{ ((stacks | default([])) + (git_stacks | default([]))) | map(attribute='name') | list | join(', ') }}

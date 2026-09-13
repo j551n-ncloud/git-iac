@@ -1,0 +1,159 @@
+---
+# Takes a Proxmox snapshot of this host's LXC before anything is
+# deployed to it, so a bad deploy is one rollback away.
+#
+# Runs entirely on the CONTROLLER against the Proxmox API. It never
+# touches the target over SSH, and it lives in its own play that
+# completes before the deploy play starts - so if a snapshot cannot be
+# taken, nothing has been deployed yet.
+#
+# Fails closed, deliberately. A snapshot you believe you have but do
+# not is worse than knowing you have none.
+#
+# Uses ansible.builtin.uri rather than community.general.proxmox_snap:
+# that module needs the `proxmoxer` Python library on the controller,
+# and this repo already avoids SDK-backed modules for the same reason
+# (see the docker CLI comments in roles/docker_stack). Four HTTP calls
+# are cheaper than a collection plus a pip dependency.
+
+- name: Verify the Proxmox API and this host's coordinates are set
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - proxmox_api_url | length > 0
+      - proxmox_api_token_id | length > 0
+      - proxmox_api_token_secret | length > 0
+      - proxmox_node is defined
+      - proxmox_node | length > 0
+      - proxmox_vmid is defined
+    fail_msg: >-
+      {{ inventory_hostname }}: snapshot_before_deploy is on but the
+      Proxmox coordinates are incomplete. Needs proxmox_api_url,
+      proxmox_api_token_id and proxmox_api_token_secret (CI/CD
+      variables), plus proxmox_node and proxmox_vmid in
+      inventory/host_vars/{{ inventory_hostname }}.yml. Nothing has
+      been deployed.
+
+# Proxmox accepts [A-Za-z][A-Za-z0-9_-]* up to 40 chars, so the
+# timestamp is compact and the prefix must start with a letter.
+# Sorting these names lexically is the same as sorting them by age,
+# which is what the prune step below relies on.
+- name: Compose the snapshot name and description
+  ansible.builtin.set_fact:
+    snapshot_name: "{{ proxmox_snapshot_prefix }}-{{ now(utc=true, fmt='%Y%m%d-%H%M%S') }}"
+    snapshot_description: >-
+      Pre-deploy snapshot taken by playbooks/deploy.yml.
+      {{ ('commit ' + lookup('env', 'CI_COMMIT_SHORT_SHA')) if lookup('env', 'CI_COMMIT_SHORT_SHA') else 'local run' }}
+      {{ ('pipeline ' + lookup('env', 'CI_PIPELINE_ID')) if lookup('env', 'CI_PIPELINE_ID') else '' }}
+
+# no_log on every task carrying the token: `uri` echoes its full
+# arguments on failure, which would put the API secret in the job log
+# where GitLab's masking cannot help (it masks variables, not strings
+# Ansible reassembles). The debug task after each one reports what
+# happened without the credential.
+- name: "{{ inventory_hostname }} | Create snapshot {{ snapshot_name }}"
+  ansible.builtin.uri:
+    url: "{{ proxmox_api_url }}/api2/json/nodes/{{ proxmox_node }}/lxc/{{ proxmox_vmid }}/snapshot"
+    method: POST
+    headers:
+      Authorization: "PVEAPIToken={{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
+    body_format: form-urlencoded
+    body:
+      snapname: "{{ snapshot_name }}"
+      description: "{{ snapshot_description }}"
+    validate_certs: "{{ proxmox_api_validate_certs }}"
+    status_code: 200
+    timeout: 30
+  delegate_to: localhost
+  register: snapshot_create
+  no_log: true
+
+# Proxmox returns a UPID immediately and does the work asynchronously,
+# so a 200 here means "accepted", not "snapshotted". Poll the task.
+- name: "{{ inventory_hostname }} | Wait for the snapshot task to finish"
+  ansible.builtin.uri:
+    url: >-
+      {{ proxmox_api_url }}/api2/json/nodes/{{ proxmox_node }}/tasks/{{ snapshot_create.json.data | urlencode }}/status
+    method: GET
+    headers:
+      Authorization: "PVEAPIToken={{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
+    validate_certs: "{{ proxmox_api_validate_certs }}"
+    status_code: 200
+    timeout: 30
+  delegate_to: localhost
+  register: snapshot_task
+  until: snapshot_task.json.data.status == "stopped"
+  retries: "{{ proxmox_snapshot_retries }}"
+  delay: 5
+  no_log: true
+
+# "stopped" only means it finished. It can finish having failed - most
+# commonly because the container's storage backend cannot snapshot at
+# all (a plain directory/ext4 storage cannot; ZFS, LVM-thin and btrfs
+# can). That is a hard stop, not a warning.
+- name: "{{ inventory_hostname }} | The snapshot must have succeeded"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - snapshot_task.json.data.exitstatus == "OK"
+    fail_msg: >-
+      {{ inventory_hostname }}: Proxmox finished the snapshot task with
+      "{{ snapshot_task.json.data.exitstatus | default('unknown') }}".
+      A storage backend that cannot snapshot (plain directory storage)
+      reports here. Nothing has been deployed to this host.
+
+- name: "{{ inventory_hostname }} | Snapshot taken"
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} (node {{ proxmox_node }}, vmid
+      {{ proxmox_vmid }}): snapshot {{ snapshot_name }} created.
+
+- name: "{{ inventory_hostname }} | List existing snapshots"
+  ansible.builtin.uri:
+    url: "{{ proxmox_api_url }}/api2/json/nodes/{{ proxmox_node }}/lxc/{{ proxmox_vmid }}/snapshot"
+    method: GET
+    headers:
+      Authorization: "PVEAPIToken={{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
+    validate_certs: "{{ proxmox_api_validate_certs }}"
+    status_code: 200
+    timeout: 30
+  delegate_to: localhost
+  register: snapshot_list
+  no_log: true
+
+# The listing always contains a pseudo-entry named "current" for the
+# running state, which the prefix match drops along with every
+# hand-made snapshot. Names sort chronologically, so the ones to prune
+# are simply everything before the last `proxmox_snapshot_keep`.
+- name: "{{ inventory_hostname }} | Work out which snapshots to prune"
+  ansible.builtin.set_fact:
+    snapshots_to_prune: "{{ prefixed[:-(proxmox_snapshot_keep | int)] if (prefixed | length) > (proxmox_snapshot_keep | int) else [] }}"
+  vars:
+    prefixed: >-
+      {{ snapshot_list.json.data
+         | map(attribute='name')
+         | select('match', '^' + proxmox_snapshot_prefix + '-')
+         | sort
+         | list }}
+
+- name: "{{ inventory_hostname }} | Prune snapshots beyond the last {{ proxmox_snapshot_keep }}"
+  ansible.builtin.uri:
+    url: "{{ proxmox_api_url }}/api2/json/nodes/{{ proxmox_node }}/lxc/{{ proxmox_vmid }}/snapshot/{{ item }}"
+    method: DELETE
+    headers:
+      Authorization: "PVEAPIToken={{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
+    validate_certs: "{{ proxmox_api_validate_certs }}"
+    status_code: 200
+    timeout: 30
+  delegate_to: localhost
+  loop: "{{ snapshots_to_prune }}"
+  loop_control:
+    label: "{{ item }}"
+  no_log: true
+
+- name: "{{ inventory_hostname }} | Report pruned snapshots"
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: pruned
+      {{ snapshots_to_prune | join(', ') if snapshots_to_prune else 'nothing' }}
+      (keeping the last {{ proxmox_snapshot_keep }}).

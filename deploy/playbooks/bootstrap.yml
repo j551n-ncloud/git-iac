@@ -1,0 +1,46 @@
+---
+# One-time host setup, run by hand from an admin workstation (not from
+# CI) before a host ever runs playbooks/deploy.yml. Idempotent - re-run
+# it whenever a host gains a stack, so the new directory exists and is
+# owned correctly before the next routine deploy.
+#
+#   ansible-playbook -i inventory/ --limit <host> playbooks/bootstrap.yml \
+#     -e ansible_user=root -e ansible_become=false --ask-pass
+#
+# Connecting as root with `-e ansible_become=false` is how you bootstrap
+# a NEW host: the deploy account doesn't exist yet, and as root there is
+# nothing to escalate to. `-e ansible_user=root` only changes the
+# *connection* user - the account being created comes from
+# `deploy_user`, so the two can't be confused.
+#
+# Re-running on an already-bootstrapped host can instead use the deploy
+# key, but only where that account has sudo (i.e. hosts with a
+# `become: true` stack - here host-a and host-c):
+#
+#   ansible-playbook -i inventory/ --limit host-a playbooks/bootstrap.yml \
+#     --private-key <deploy key>
+#
+# On hosts where the deploy user has no sudo by design (vaultwarden,
+# tools, registry, host-x), bootstrap re-runs still need
+# root - it creates users and writes under /etc.
+#
+# What it does, in order (see roles/host_bootstrap/tasks/*.yml):
+#   python.yml       install Python, via raw, before anything needs it
+#   user.yml         the deploy account + docker group membership
+#   ssh_key.yml      the deploy key, at whatever path sshd really reads
+#   directories.yml  deploy_root + every stack directory for this host
+#   sudo.yml         passwordless sudo, only if a stack sets become: true
+
+- name: Ensure Python is present (every other module needs it; raw doesn't)
+  hosts: all
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Bootstrap a Python interpreter
+      ansible.builtin.import_tasks: ../roles/host_bootstrap/tasks/python.yml
+
+- name: Bootstrap a deploy target
+  hosts: all
+  become: true
+  roles:
+    - host_bootstrap

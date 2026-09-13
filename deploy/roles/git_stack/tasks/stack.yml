@@ -1,0 +1,205 @@
+---
+# Included once per entry in `git_stacks`, with the current item
+# available as `stack` (see tasks/main.yml).
+#
+#   git_stacks:
+#     - name: dashboard
+#       repo: git@github.com:example-org/dashboard.git
+#       path: /data/dashboard
+#       version: d8b4cfc...       # pinned commit - see below
+#       become: true              # the checkout is root-owned
+#       env_vault: true           # render .env from env_src/env.j2
+#       env_src: compose/dashboard
+#
+# `version` is a commit SHA on purpose, not a branch. A branch would
+# make "what is deployed" a property of whenever the last run happened
+# rather than of this repo, which is the same reason every compose file
+# here pins an image tag instead of tracking :latest. Bumping it is
+# then an explicit, reviewable diff - and the deployed commit is
+# recoverable from git history alone.
+#
+# --check DOES NOT WORK on this role, and the failure looks alarming:
+#
+#   fatal: couldn't find remote ref 5462bc2f43...
+#
+# That is not a bad pin. ansible.builtin.git takes a different path in
+# check mode (get_remote_head -> get_sha_hash) that asks the SERVER to
+# resolve the version with `git fetch --dry-run <remote> <sha>`.
+# GitHub, like most forges, refuses to serve an arbitrary SHA that
+# isn't a ref, so any commit pin fails that call - a branch name would
+# pass and tell you nothing useful. A real run never takes that path:
+# it fetches refs normally and then checks the SHA out locally.
+#
+# So verify a pin with `git log --oneline <sha>` in the stack's own
+# repo, not with --check. playbooks/preflight.yml covers the rest of
+# what a dry run would have told you, and touches no host.
+
+- name: "{{ stack.name }} | Resolve remote stack directory"
+  ansible.builtin.set_fact:
+    git_stack_path: "{{ stack.path | default(deploy_root + '/' + stack.name) }}"
+
+- name: "{{ stack.name }} | Manage checkout and containers"
+  become: "{{ stack.become | default(false) }}"
+  block:
+    # dashboard's .env is TRACKED in its repo, not gitignored - upstream
+    # committed the production values (see "Commit Garmin and vendored-lib
+    # production config to .env", 5462bc2). Without this task that
+    # breaks the role two ways:
+    #
+    #   1. the .env rendered below leaves the working tree permanently
+    #      dirty, so the NEXT run's git task refuses with "Local
+    #      modifications exist in the destination (force=no)" - first
+    #      deploy fine, every one after it fails;
+    #   2. even with that worked around, every run would rewrite .env
+    #      over the committed version, report changed, and trigger
+    #      recreate: always - a full restart of the stack on every
+    #      deploy, forever.
+    #
+    # skip-worktree tells git to stop looking at this one file, so
+    # `git status --porcelain` (which is exactly what the git module
+    # checks) stays clean and the rendered .env survives. Scoped to
+    # the single file this role owns: a genuine mid-incident edit to
+    # anything else in the checkout still stops the deploy, which is
+    # the point of force: false below.
+    #
+    # The tradeoff, deliberately taken: if a future pinned commit
+    # CHANGES .env, git refuses to check it out rather than clobbering
+    # the rendered one. That is a loud, obvious failure at deploy time,
+    # and the right response is to update compose/dashboard/env.j2 - the
+    # alternative silently reverts every secret to whatever upstream
+    # committed.
+    #
+    # The proper fix is upstream: `git rm --cached .env`, gitignore it,
+    # rotate. Those values are in the repo's history either way.
+    #
+    # `|| exit 0` on ls-files: in a repo where .env is correctly
+    # untracked there is nothing to flag, which is the good case.
+    - name: "{{ stack.name }} | Stop git tracking changes to the .env this role owns"
+      ansible.builtin.shell: |
+        git ls-files --error-unmatch .env >/dev/null 2>&1 || exit 0
+        git update-index --skip-worktree .env
+      args:
+        chdir: "{{ git_stack_path }}"
+      changed_when: false
+      when: stack.env_vault | default(false)
+
+    # force: false by default, so a local edit on the host stops the
+    # deploy instead of being silently thrown away. Someone editing a
+    # file in place there is usually mid-incident, and discarding that
+    # without saying so is the worst available outcome. A stack that
+    # genuinely wants host state overwritten every run can set
+    # `git_force: true`.
+    - name: "{{ stack.name }} | Check out the pinned commit"
+      ansible.builtin.git:
+        repo: "{{ stack.repo }}"
+        dest: "{{ git_stack_path }}"
+        version: "{{ stack.version }}"
+        force: "{{ stack.git_force | default(false) }}"
+        update: true
+      register: git_checkout
+
+    # Untracked in the checkout, which is fine: the git module's
+    # local-modification check ignores `??` lines.
+    - name: "{{ stack.name }} | Copy this repo's compose overlay into the checkout"
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../{{ stack.compose_overlay }}"
+        dest: "{{ git_stack_path }}/docker-compose.deploy.yml"
+        mode: "0644"
+      register: overlay_copy
+      when: stack.compose_overlay is defined
+
+    - name: "{{ stack.name }} | Render .env from vault-sourced secrets"
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../{{ stack.env_src }}/env.j2"
+        dest: "{{ git_stack_path }}/.env"
+        mode: "0600"
+      register: env_render
+      when: stack.env_vault | default(false)
+
+    # recreate is the one thing that differs from docker_stack, for the
+    # same reason it applies there to extra_files - and it matters more
+    # here. compose's own change detection diffs the service definition,
+    # so it cannot see that a bind-mounted file's CONTENT changed, and
+    # this stack bind-mounts config/ and nginx.conf.template, which is
+    # most of what a dashboard change actually is. Without this, a pull that
+    # rewrites the dashboard config would land on disk and leave every
+    # container running the old one.
+    - name: "{{ stack.name }} | (Re)create the stack"
+      community.docker.docker_compose_v2:
+        project_src: "{{ git_stack_path }}"
+        # Checkout's file first, overlay second - later -f wins.
+        files: >-
+          {{ [stack.compose_file | default('docker-compose.yml')]
+             + (['docker-compose.deploy.yml'] if stack.compose_overlay is defined else []) }}
+        pull: "{{ stack.pull | default('missing') }}"
+        # Every image this fleet builds now comes from Harbor, tagged with
+        # the commit it was built from, so nothing here needs building on
+        # the target because a pin moved. `policy` still builds a service
+        # whose image is genuinely absent - which is what keeps dashboard's
+        # vendored vendored-lib api/web working, since those are upstream's and
+        # services/build does not produce them.
+        #
+        # This used to force `always` whenever the checkout moved, back
+        # when api and mcp were built here. That is gone: a forced
+        # rebuild of an image that should have been pulled is exactly how
+        # a wrong tag hides itself.
+        # never, not policy: with every buildable service pinned, a tag
+        # the registry lacks must fail loudly rather than quietly build
+        # locally under the right name and report a green deploy.
+        build: never
+        state: present
+        remove_orphans: true
+        recreate: >-
+          {{ 'always'
+             if (git_checkout.changed
+                 or (env_render.changed | default(false))
+                 or (overlay_copy.changed | default(false)))
+             else 'auto' }}
+      register: compose_result
+
+    # Identical to docker_stack's - see its comments for why this polls
+    # rather than trusting `docker compose up`'s exit code, and why it
+    # shells out instead of using community.docker's info modules.
+    #
+    # `ps -q` (not `-aq`) also handles this stack's one-shot service:
+    # vendored-lib-media downloads ~140MB of exercise media once and exits 0,
+    # and only `-aq` would list it. Checking a deliberately-exited
+    # container for "running" would fail every deploy.
+    - name: "{{ stack.name }} | Wait until containers are running and healthy"
+      ansible.builtin.shell: |
+        {% raw %}
+        ids=$(docker compose ps -q)
+        [ -n "$ids" ] || { echo "no containers in this project"; exit 1; }
+        out=$(docker inspect \
+                --format '{{.Name}} {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+                $ids)
+        echo "$out"
+        echo "$out" | awk '{
+          if ($2 != "running")                        bad = 1
+          if ($3 == "starting" || $3 == "unhealthy")  bad = 1
+        } END { exit bad + 0 }'
+        {% endraw %}
+      args:
+        chdir: "{{ git_stack_path }}"
+      register: git_stack_health
+      until: git_stack_health.rc == 0
+      retries: "{{ stack.health_retries | default(12) }}"
+      delay: 5
+      changed_when: false
+
+    - name: "{{ stack.name }} | Report result"
+      ansible.builtin.debug:
+        msg: >-
+          {{ stack.name }} ({{ git_stack_path }} @ {{ stack.version }}):
+          {{ 'updated' if compose_result.changed else 'already up to date' }}
+          - {{ git_stack_health.stdout_lines | default([]) | length }} container(s) running/healthy
+
+    - name: "{{ stack.name }} | Record result for the end-of-run summary"
+      ansible.builtin.set_fact:
+        stack_results: >-
+          {{ (stack_results | default([])) + [{
+            'host': inventory_hostname,
+            'stack': stack.name,
+            'changed': compose_result.changed,
+            'containers': git_stack_health.stdout_lines | default([]) | length,
+          }] }}

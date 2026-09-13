@@ -1,0 +1,5 @@
+---
+# Runs tailscale directly (not in docker) - not managed by this
+# playbook. Leave stacks empty; roles/docker_stack skips hosts with no
+# stacks defined instead of erroring on the docker checks.
+stacks: []

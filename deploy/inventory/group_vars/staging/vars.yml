@@ -1,0 +1,11 @@
+---
+# Stacks deployed to every host in the "staging" group.
+# compose_src is a path relative to the repo root, resolved against
+# playbook_dir in roles/docker_stack/tasks/stack.yml.
+stacks:
+  - name: web
+    compose_src: compose/web
+
+  - name: api
+    compose_src: compose/api
+    env_vault: true   # renders compose/api/env.j2 using vars from vault.yml

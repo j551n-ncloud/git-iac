@@ -1,0 +1,44 @@
+services:
+  ghost:
+    image: ghost:6.63.0-alpine3.23
+    container_name: ghost
+    restart: unless-stopped
+    ports:
+      - "2368:2368"
+    environment:
+      NODE_ENV: production
+      url: https://blog.example.com
+      database__client: mysql
+      database__connection__host: db
+      database__connection__user: ghost
+      database__connection__password: ${GHOST_DB_PASSWORD}
+      database__connection__database: ghost
+      server__host: 0.0.0.0
+      server__port: 2368
+      mail__transport: SMTP
+      mail__from: "'Example Blog' <mail@example.com>"
+      mail__options__host: smtp.gmail.com
+      mail__options__port: 465
+      mail__options__secure: "true"
+      mail__options__auth__user: mail@example.com
+      mail__options__auth__pass: ${GHOST_MAIL_PASSWORD}
+    volumes:
+      - ./content:/var/lib/ghost/content
+    depends_on:
+      db:
+        condition: service_started
+  db:
+    # image-check: ignore - Docker Hub's mysql repo now carries several
+    # concurrent numbering tracks (8.x LTS, 9.x innovation, and an
+    # unrelated-looking 26.x one) under the same tag list, so "biggest
+    # version wins" isn't a safe comparison here. Bump by hand.
+    image: mysql:8.0
+    container_name: ghost-db-1
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${GHOST_MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ghost
+      MYSQL_USER: ghost
+      MYSQL_PASSWORD: ${GHOST_DB_PASSWORD}
+    volumes:
+      - ./data/mysql:/var/lib/mysql

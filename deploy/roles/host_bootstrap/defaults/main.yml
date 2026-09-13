@@ -1,0 +1,10 @@
+---
+# Public half of the deploy keypair (the private half is the
+# SSH_PRIVATE_KEY CI/CD variable). Public keys aren't secret, so this
+# would normally be safe to commit as-is - this is a placeholder,
+# override with -e deploy_public_key=... for your own keypair.
+deploy_public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLEKEYCHANGEMECHANGEMECHANGEME deploy@example"
+
+# Shell given to the deploy user. /bin/bash exists on every host in
+# this fleet today (checked), including the Alpine ones.
+deploy_user_shell: /bin/bash

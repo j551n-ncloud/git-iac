@@ -1,0 +1,25 @@
+---
+# Daily check for submodules whose source has moved past the pointer
+# here. A submodule only moves when someone runs sync-submodule.sh, so a
+# commit pushed straight to the source repo leaves this repo stale and
+# nothing builds from it.
+#
+# Schedule: SCHEDULE_TASK=submodule-check. Needs no submodules checked
+# out and no Docker - just git ls-remote, which for the private dashboard
+# repo needs the SSH key.
+submodule-check:
+  stage: scan
+  image: ghcr.io/example-org/build-ci-image:latest
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_TASK == "submodule-check"'
+  before_script:
+    - eval "$(ssh-agent -s)" >/dev/null
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - install -m 600 "$GIT_SSH_PRIVATE_KEY" ~/.ssh/build_key
+    - ssh-add ~/.ssh/build_key
+    - ssh-keyscan -t rsa,ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+    - ssh-keyscan -p 2224 -t rsa,ed25519 ssh.gitlab.example.com >> ~/.ssh/known_hosts 2>/dev/null
+  script:
+    - python3 scripts/check_submodules.py

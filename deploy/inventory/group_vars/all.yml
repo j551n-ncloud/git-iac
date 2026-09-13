@@ -1,0 +1,52 @@
+---
+# Vars shared by every environment. Environment-specific files
+# (group_vars/<env>/vars.yml) override these, and
+# host_vars/<hostname>.yml can override per host on top of that.
+#
+# NOTE: group_vars/ and host_vars/ must live INSIDE inventory/ because
+# the inventory source is the inventory/ directory - Ansible's
+# host_group_vars plugin resolves them relative to the inventory
+# source, so at the project root they'd be silently ignored during
+# playbook runs (ansible-inventory would still show them, which makes
+# that mistake very easy to miss).
+
+# The account this pipeline connects as for routine deploys.
+ansible_user: deploy
+
+# The account that owns the stacks on the target host. Deliberately a
+# separate variable from ansible_user: bootstrap.yml has to connect as
+# some *other* admin user (root) on a host where this account doesn't
+# exist yet, and overriding ansible_user for that must not change
+# which account gets created/owns things.
+deploy_user: deploy
+
+ansible_python_interpreter: /usr/bin/python3
+
+# Root directory on the target host under which every stack gets its
+# own subdirectory: {{ deploy_root }}/{{ stack.name }}/
+deploy_root: /opt/stacks
+
+# Remove dangling images after each deploy. Off by default; turn on
+# per environment if disk space is a concern.
+docker_compose_prune: false
+
+# Host key verification is deliberately OFF. This connects to whatever
+# answers on the address in inventory/hosts.ini, without checking it is
+# the host we think it is.
+#
+# What that gives up: the deploy renders env.j2 from the vault and
+# copies the result to the target (roles/docker_stack/tasks/stack.yml),
+# so anything that takes over one of these IPs is handed those secrets.
+# Pubkey auth still protects the deploy key itself - the exposure is the
+# payload, not the credential.
+#
+# Accepted knowingly: these are static addresses on a private LAN, and
+# the alternative was maintaining a committed known_hosts and
+# regenerating it every time an LXC is rebuilt or re-addressed.
+#
+# UserKnownHostsFile=/dev/null so successful connections never write
+# into the operator's real ~/.ssh/known_hosts, which would otherwise
+# produce mismatch errors later. LogLevel=ERROR suppresses the
+# "Permanently added ... to the list of known hosts" line each of those
+# writes would print.
+ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"

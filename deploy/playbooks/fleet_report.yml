@@ -1,0 +1,99 @@
+---
+# Read-only inspection of what's actually accumulated on disk across the
+# fleet - every Proxmox snapshot (not just the ones roles/proxmox_snapshot
+# manages) and every docker image, with a note on which ones no running
+# container references (what `docker image prune -a` would reclaim that
+# the routine dangling-only prune in roles/docker_stack does not).
+#
+# Never deletes anything. The point is to look before deciding whether
+# to prune further - see the Roadmap wiki page / commit history for that decision.
+#
+# Run manually, same credentials as a deploy:
+#   ansible-playbook -i inventory/ playbooks/fleet_report.yml \
+#     --vault-password-file .vault_pass.txt
+
+- name: Report every Proxmox snapshot per managed host
+  hosts: managed
+  gather_facts: false
+  connection: local
+  # connection: local alone keeps this task's identity as the real
+  # inventory host (e.g. pocketid), which inherits
+  # ansible_python_interpreter: /usr/bin/python3 from group_vars/all.yml
+  # - correct for that host over SSH, wrong for a task actually running
+  # in this container (python lives at /usr/local/bin here). Explicit
+  # delegate_to: localhost switches to Ansible's special implicit-
+  # localhost pseudo-host instead, which resolves its own interpreter
+  # correctly - same pattern roles/proxmox_snapshot already relies on.
+  tasks:
+    - name: "{{ inventory_hostname }} | Verify Proxmox coordinates are set"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: no proxmox_node/proxmox_vmid in
+          host_vars - skipping snapshot report for this host.
+      when: proxmox_node is not defined or proxmox_vmid is not defined
+
+    # proxmox_api_validate_certs isn't defined here the way it is in
+    # deploy.yml's snapshot play - that one only exists because it
+    # include_roles the proxmox_snapshot role, which this playbook
+    # deliberately doesn't (it's read-only, no snapshot creation).
+    # default(false) mirrors that role's own default instead.
+    - name: "{{ inventory_hostname }} | List every snapshot"
+      ansible.builtin.uri:
+        url: "{{ proxmox_api_url }}/api2/json/nodes/{{ proxmox_node }}/lxc/{{ proxmox_vmid }}/snapshot"
+        method: GET
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_api_validate_certs | default(false) }}"
+        status_code: 200
+        timeout: 30
+      delegate_to: localhost
+      register: snapshot_list
+      # Deliberately no `no_log: true` here, unlike
+      # roles/proxmox_snapshot's identical-shaped call: the token
+      # secret is a masked CI/CD variable, so GitLab redacts it from
+      # the log regardless, and having the real output on failure is
+      # worth more than the residual risk of Ansible reformatting it in
+      # a way that slips past that masking.
+      when: proxmox_node is defined and proxmox_vmid is defined
+
+    # "current" is Proxmox's pseudo-entry for the running state, not a
+    # real snapshot - dropped the same way roles/proxmox_snapshot does.
+    # Same defaults-aren't-in-scope note as above: "ci" and 3 mirror
+    # roles/proxmox_snapshot/defaults/main.yml's own prefix and keep.
+    - name: "{{ inventory_hostname }} | Report snapshots (oldest first)"
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.name }}
+          [{{ 'ci-managed, auto-pruned to last ' + (proxmox_snapshot_keep | default(3) | string) if item.name.startswith(proxmox_snapshot_prefix | default('ci') + '-') else 'NOT ci-managed - manual or another tool, never auto-pruned' }}]
+          snaptime={{ item.snaptime | default('n/a') }}
+      loop: >-
+        {{ (snapshot_list.json.data | default([]))
+           | rejectattr('name', 'equalto', 'current')
+           | sort(attribute='name') }}
+      loop_control:
+        label: "{{ item.name }}"
+      when: proxmox_node is defined and proxmox_vmid is defined
+
+    - name: "{{ inventory_hostname }} | Nothing but 'current'"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: no snapshots at all."
+      when: >-
+        proxmox_node is defined and proxmox_vmid is defined
+        and (snapshot_list.json.data | default([]) | rejectattr('name', 'equalto', 'current') | list | length) == 0
+
+- name: Report docker disk usage per managed host
+  hosts: managed
+  gather_facts: false
+  tasks:
+    # `-v` breaks it down per image, including how many containers
+    # actually reference each one - a CONTAINERS count of 0 is exactly
+    # what `docker image prune -a` would be free to remove that the
+    # routine dangling-only prune (roles/docker_stack) leaves alone.
+    - name: "{{ inventory_hostname }} | docker system df -v"
+      ansible.builtin.command: docker system df -v
+      register: docker_df
+      changed_when: false
+
+    - name: "{{ inventory_hostname }} | Disk usage"
+      ansible.builtin.debug:
+        msg: "{{ docker_df.stdout_lines }}"
