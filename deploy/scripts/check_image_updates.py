@@ -26,6 +26,11 @@ Deliberately conservative:
     registries like registry.example.com, or a private ghcr.io image) is
     skipped rather than guessed at
 
+Nothing is dropped silently: every image line it does not check is
+printed under `not checked` with the reason. An image this script never
+queried used to print nothing at all, which reads the same as a healthy
+one - that is how all six images of one compose stack fell out of the check.
+
 A plain tag-pinned image (`image: repo:1.2.3`) is routine to bump, so
 it gets a merge request with the tag already swapped - merging it is
 the whole action (and, like any other compose edit, immediately
@@ -35,12 +40,18 @@ with a comment explaining it isn't a routine bump (a dev build, a
 migration risk) - those only ever get an issue, never a one-click MR,
 so the deliberate step the comment calls for can't be skipped by
 accident.
+
+A bump MR whose every bump stays within the same major version (patch
+or minor, see bump_level) is also set to merge when its pipeline
+succeeds, so routine bumps reach production via auto-deploy without a
+manual merge. An MR with any major bump keeps waiting for a human.
 """
 from __future__ import annotations
 
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -90,6 +101,17 @@ PLATFORM_MARKERS = (
     "386", "ppc64le", "s390x", "riscv64", "x86_64",
 )
 
+# Bump levels an MR may auto-merge at. An MR auto-merges only when every
+# bump in it is one of these; a single major bump holds the whole MR
+# for review.
+AUTO_MERGE_LEVELS = ("patch", "minor")
+
+# How long to wait for GitLab to create the pipeline of a freshly pushed
+# bump branch before giving up on auto-merge for this run. Auto-merge
+# needs a head pipeline to attach to; if it isn't there yet, the next
+# daily run picks the MR up again.
+PIPELINE_WAIT_SECONDS = 60
+
 SESSION = requests.Session()
 SESSION.headers["User-Agent"] = "deploy-image-update-check/1.0"
 
@@ -100,7 +122,7 @@ class ImageRef:
     file: Path
     line: int
     registry: str  # e.g. "docker.io", "ghcr.io", "registry.example.com"
-    repo: str  # e.g. "grafana/grafana", "library/mysql"
+    repo: str  # e.g. "example/app", "library/mysql"
     current_tag: str
     pinned_by_digest: bool
     # The exact "repo:tag" substring as written on that line, e.g.
@@ -111,9 +133,29 @@ class ImageRef:
 
 
 @dataclass
+class Skipped:
+    """An image line this run did not check, and why. Printed rather than
+    dropped: in a silent run an unchecked image is indistinguishable from
+    an up-to-date one, and a stack can fall out of the check entirely
+    without anyone noticing (one stack did, for six images)."""
+    stack: str
+    line: int
+    image: str  # as written on the line, or "registry/repo:tag" once parsed
+    reason: str
+
+    def display(self) -> str:
+        repo, sep, digest = self.image.partition("@sha256:")
+        return f"{repo}@sha256:{digest[:12]}..." if sep else self.image
+
+
+@dataclass
 class Outdated:
     ref: ImageRef
     latest_tag: str
+
+    @property
+    def level(self) -> str:
+        return bump_level(self.ref.current_tag, self.latest_tag)
 
 
 def parse_version(tag: str):
@@ -133,6 +175,20 @@ def parse_version(tag: str):
     return core, suffix_nums
 
 
+def bump_level(current_tag: str, latest_tag: str) -> str:
+    """"major", "minor" or "patch" for a bump between two tags that
+    latest_stable_tag already found comparable. Only a change in the
+    first component is major, a change in the second is minor, anything
+    else (third/fourth component, or just the suffix) is patch. A
+    single-component tag ("8" -> "9") can only ever be a major bump."""
+    cur, new = parse_version(current_tag), parse_version(latest_tag)
+    if cur is None or new is None or cur[0][0] != new[0][0]:
+        return "major"
+    if len(cur[0]) > 1 and cur[0][1] != new[0][1]:
+        return "minor"
+    return "patch"
+
+
 def version_key(parsed, width: int):
     core, suffix_nums = parsed
     return core + (0,) * (width - len(core)), suffix_nums
@@ -145,6 +201,16 @@ def split_registry(repo_path: str):
     if not sep:
         return "docker.io", f"library/{repo_path}"
     return "docker.io", repo_path
+
+
+def split_tag(repo_path: str) -> tuple[str, str | None]:
+    """Split a trailing ":tag" off an image path: a colon names a tag only
+    when what follows it isn't a path component, so a registry port
+    (registry.example.com:5000/x) doesn't read as one."""
+    repo, sep, tag = repo_path.rpartition(":")
+    if not sep or "/" in tag:
+        return repo_path, None
+    return repo, tag
 
 
 def comment_block_above(lines: list[str], i: int, max_lookback: int = 25) -> list[str]:
@@ -161,8 +227,9 @@ def comment_block_above(lines: list[str], i: int, max_lookback: int = 25) -> lis
     return block
 
 
-def find_images() -> list[ImageRef]:
-    refs = []
+def find_images() -> tuple[list[ImageRef], list[Skipped]]:
+    refs: list[ImageRef] = []
+    skips: list[Skipped] = []
     for compose_file in sorted(COMPOSE_DIR.glob("*/docker-compose.yml")):
         stack = compose_file.parent.name
         lines = compose_file.read_text().splitlines()
@@ -174,32 +241,43 @@ def find_images() -> list[ImageRef]:
             block = comment_block_above(lines, i)
 
             if IGNORE_RE.search(line) or any(IGNORE_RE.search(c) for c in block):
+                skips.append(Skipped(stack, i + 1, image, "image-check: ignore"))
                 continue
 
             pinned_by_digest = "@sha256:" in image
             raw_image = None
             if pinned_by_digest:
-                repo_path = image.split("@sha256:")[0]
-                tag = None
-                for c in block:
-                    hint = COMMENTED_IMAGE_RE.search(c)
-                    if hint and ":" in hint.group(1):
-                        _, _, tag = hint.group(1).rpartition(":")
-                        break
+                # Two places a digest pin can still name its version: in the
+                # ref itself (repo:TAG@sha256:...), or in the comment block
+                # above it. The ref wins - it is the one the deploy verifies.
+                repo_path, tag = split_tag(image.split("@sha256:")[0])
                 if tag is None:
-                    continue  # no recoverable version hint - skip
+                    for c in block:
+                        hint = COMMENTED_IMAGE_RE.search(c)
+                        if hint and ":" in hint.group(1):
+                            _, _, tag = hint.group(1).rpartition(":")
+                            break
+                if tag is None:
+                    skips.append(Skipped(
+                        stack, i + 1, image,
+                        "digest pin with no version hint - write the tag into the ref "
+                        "(repo:TAG@sha256:...) or name it in a comment above",
+                    ))
+                    continue
             else:
-                repo_path, sep, tag = image.rpartition(":")
-                if not sep or "/" in tag:
-                    continue  # no tag (rpartition caught a port instead)
+                repo_path, tag = split_tag(image)
+                if tag is None:
+                    skips.append(Skipped(stack, i + 1, image, "no tag on the ref"))
+                    continue
                 raw_image = image
 
             if tag in ("latest", "stable"):
+                skips.append(Skipped(stack, i + 1, image, f"floating tag {tag}"))
                 continue
 
             registry, repo = split_registry(repo_path)
             refs.append(ImageRef(stack, compose_file, i + 1, registry, repo, tag, pinned_by_digest, raw_image))
-    return refs
+    return refs, skips
 
 
 def fetch_dockerhub_tags(repo: str, max_pages: int = 5) -> list[str] | None:
@@ -225,7 +303,17 @@ def fetch_dockerhub_tags(repo: str, max_pages: int = 5) -> list[str] | None:
     return tags
 
 
-def fetch_ghcr_tags(repo: str) -> list[str] | None:
+def fetch_ghcr_tags(repo: str, max_pages: int = 20) -> list[str] | None:
+    """Every tag in the repo, following the registry's pagination.
+
+    This MUST page. /v2/<repo>/tags/list returns one page and points at
+    the next through a Link header, and the order is push order, not
+    version order - so a repo with a few hundred tags (one stack's six have
+    200+ each, most of them sha-<commit>) answers a bare request with its
+    OLDEST tags and nothing else. Read only that page and every one of
+    those images looks pinned at its newest version when it is releases
+    behind, which is exactly what this script reported until 2026-09-15.
+    """
     try:
         token_resp = SESSION.get(
             "https://ghcr.io/token",
@@ -234,35 +322,47 @@ def fetch_ghcr_tags(repo: str) -> list[str] | None:
         )
         token_resp.raise_for_status()
         token = token_resp.json()["token"]
-        resp = SESSION.get(
-            f"https://ghcr.io/v2/{repo}/tags/list",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=15,
-        )
-        if resp.status_code == 401:
-            print(f"  ~ ghcr.io/{repo} is private (no anonymous pull) - skipping", file=sys.stderr)
-            return None
-        resp.raise_for_status()
-        return resp.json().get("tags", [])
+        headers = {"Authorization": f"Bearer {token}"}
+
+        tags: list[str] = []
+        url, params = f"https://ghcr.io/v2/{repo}/tags/list", {"n": 1000}
+        for _ in range(max_pages):
+            resp = SESSION.get(url, headers=headers, params=params, timeout=15)
+            if resp.status_code == 401:
+                print(f"  ~ ghcr.io/{repo} is private (no anonymous pull) - skipping", file=sys.stderr)
+                return None
+            resp.raise_for_status()
+            tags.extend(resp.json().get("tags", []))
+            nxt = resp.links.get("next", {}).get("url")
+            if not nxt:
+                return tags
+            # The Link header is relative (/v2/...), and already carries
+            # its own `n`/`last` query string.
+            url, params = requests.compat.urljoin("https://ghcr.io", nxt), None
+        print(f"  ! ghcr.io/{repo} has more than {max_pages} pages of tags - list truncated", file=sys.stderr)
+        return tags
     except requests.RequestException as e:
         print(f"  ! ghcr.io request failed for {repo}: {e}", file=sys.stderr)
         return None
 
 
-def latest_stable_tag(ref: ImageRef) -> str | None:
+def latest_stable_tag(ref: ImageRef) -> tuple[str | None, str | None]:
+    """(newer tag, None) when an upgrade is available, (None, None) when the
+    pin is already the newest on its track, (None, reason) when this image
+    could not be checked at all."""
     current = parse_version(ref.current_tag)
     if current is None:
-        return None  # current tag isn't version-looking - nothing to compare against
+        return None, f"tag {ref.current_tag} has no version ordering to compare against"
 
     if ref.registry == "docker.io":
         tags = fetch_dockerhub_tags(ref.repo)
     elif ref.registry == "ghcr.io":
         tags = fetch_ghcr_tags(ref.repo)
     else:
-        return None  # private/unsupported registry - skip rather than guess
+        return None, f"{ref.registry} is not queried (private/unsupported registry)"
 
     if not tags:
-        return None
+        return None, "no tag list available from the registry"
 
     # Restrict to tags with the same number of dot-separated components as
     # the current one (e.g. "8.0" only compares against other X.Y tags).
@@ -275,7 +375,7 @@ def latest_stable_tag(ref: ImageRef) -> str | None:
     parsed_tags = [(t, parse_version(t)) for t in tags]
     parsed_tags = [(t, p) for t, p in parsed_tags if p is not None and len(p[0]) == width]
     if not parsed_tags:
-        return None
+        return None, f"registry publishes no comparable {width}-component tags"
 
     current_key = version_key(current, width)
     best_tag, best_key = None, current_key
@@ -283,19 +383,31 @@ def latest_stable_tag(ref: ImageRef) -> str | None:
         key = version_key(parsed, width)
         if key > best_key or (key == best_key and best_tag is not None and len(tag) < len(best_tag)):
             best_key, best_tag = key, tag
-    return best_tag
+    return best_tag, None
 
 
 def check_all() -> list[Outdated]:
-    outdated = []
-    for ref in find_images():
+    refs, skips = find_images()
+    outdated: list[Outdated] = []
+    current = 0
+    for ref in refs:
         label = f"{ref.registry}/{ref.repo}"
-        latest = latest_stable_tag(ref)
+        latest, reason = latest_stable_tag(ref)
         if latest:
             print(f"  UPDATE  {ref.stack:<12} {label}:{ref.current_tag} -> {latest}")
             outdated.append(Outdated(ref, latest))
+        elif reason:
+            skips.append(Skipped(ref.stack, ref.line, f"{label}:{ref.current_tag}", reason))
         else:
             print(f"  ok      {ref.stack:<12} {label}:{ref.current_tag}")
+            current += 1
+
+    if skips:
+        print(f"\n  not checked ({len(skips)}):")
+        for s in sorted(skips, key=lambda s: (s.stack, s.line)):
+            print(f"  skip    {s.stack:<12} {s.display()}")
+            print(f"          {'':<12} {s.reason}")
+    print(f"\n  {len(outdated)} update(s), {current} current, {len(skips)} not checked\n")
     return outdated
 
 
@@ -451,25 +563,110 @@ def mr_title(stack: str, items: list[Outdated]) -> str:
     return f"{stack}: bump {len(items)} image{'s' if len(items) != 1 else ''}"
 
 
+def auto_mergeable(items: list[Outdated]) -> bool:
+    return all(o.level in AUTO_MERGE_LEVELS for o in items)
+
+
 def mr_body(stack: str, items: list[Outdated]) -> str:
+    if auto_mergeable(items):
+        note = (
+            f"**Queued for auto-merge**: every bump is {' or '.join(AUTO_MERGE_LEVELS)}, "
+            f"so this merges when its pipeline succeeds and then redeploys `{stack}` "
+            "via auto-deploy. Close it to stop that."
+        )
+    else:
+        note = (
+            f"**Needs review**: includes a major bump. Merging this redeploys `{stack}` "
+            "immediately (same as any other compose change on main), review the diff first."
+        )
     lines = [
         f"Automated bump for the `{stack}` stack: {len(items)} image(s) to the latest "
         "stable tag on the same numbering track.",
         "",
-        f"**Merging this redeploys `{stack}` immediately** (same as any other "
-        "compose change on main) - review the diff first.",
+        note,
         "",
     ]
     for o in items:
         r = o.ref
         where = f"`{r.file.relative_to(REPO_ROOT)}:{r.line}`"
-        lines.append(f"- **{r.registry}/{r.repo}**: `{r.current_tag}` -> `{o.latest_tag}` ({where})")
+        lines.append(f"- **{r.registry}/{r.repo}**: `{r.current_tag}` -> `{o.latest_tag}`, {o.level} ({where})")
     lines.append("")
     lines.append(
         f"_Opened automatically by the `check-image-updates` schedule "
         f"({os.environ.get('CI_PIPELINE_URL', 'local run')})._"
     )
     return "\n".join(lines)
+
+
+def get_mr(base: str, headers: dict, iid: int) -> dict:
+    resp = SESSION.get(f"{base}/merge_requests/{iid}", headers=headers, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def wait_for_head_pipeline(base: str, headers: dict, iid: int) -> dict:
+    """The MR, re-fetched until it has a head pipeline or
+    PIPELINE_WAIT_SECONDS runs out (GitLab creates it asynchronously
+    after the push)."""
+    deadline = time.monotonic() + PIPELINE_WAIT_SECONDS
+    while True:
+        mr = get_mr(base, headers, iid)
+        if mr.get("head_pipeline") or time.monotonic() >= deadline:
+            return mr
+        time.sleep(5)
+
+
+def sync_auto_merge(base: str, headers: dict, stack: str, iid: int, wanted: bool) -> None:
+    """Set (or cancel) merge-when-pipeline-succeeds on a bump MR. Never
+    raises on a refused merge: that leaves the MR open for a human,
+    which is the safe outcome, and must not stop the rest of the run."""
+    mr = wait_for_head_pipeline(base, headers, iid) if wanted else get_mr(base, headers, iid)
+    queued = mr.get("merge_when_pipeline_succeeds")
+
+    if not wanted:
+        if queued:
+            resp = SESSION.post(
+                f"{base}/merge_requests/{iid}/cancel_merge_when_pipeline_succeeds",
+                headers=headers,
+                timeout=15,
+            )
+            if resp.ok:
+                print(f"  cancelled auto-merge on MR !{iid} for {stack} (now has a major bump)")
+            else:
+                print(f"  ! {stack}: cancelling auto-merge on MR !{iid} returned {resp.status_code}", file=sys.stderr)
+        return
+
+    if queued:
+        print(f"  MR !{iid} for {stack} already queued for auto-merge")
+        return
+    pipeline = mr.get("head_pipeline")
+    if not pipeline:
+        print(f"  MR !{iid} for {stack} has no pipeline yet, auto-merge retried next run")
+        return
+    if pipeline.get("status") in ("failed", "canceled", "skipped"):
+        print(f"  ! {stack}: MR !{iid} pipeline {pipeline['status']}, left for review", file=sys.stderr)
+        return
+
+    resp = SESSION.put(
+        f"{base}/merge_requests/{iid}/merge",
+        headers=headers,
+        data={
+            # `sha` makes GitLab refuse if the branch moved since we
+            # looked, so only the bump checked here can merge.
+            "sha": mr["sha"],
+            "merge_when_pipeline_succeeds": True,
+            "auto_merge": True,
+            "should_remove_source_branch": True,
+        },
+        timeout=15,
+    )
+    if resp.ok:
+        state = "merged" if resp.json().get("state") == "merged" else "queued for auto-merge"
+        print(f"  MR !{iid} for {stack} {state}")
+    else:
+        # 401/403: GITLAB_API_TOKEN can't merge into protected main.
+        # 405/406/409/422: not mergeable right now (conflict, moved, ...).
+        print(f"  ! {stack}: auto-merge on MR !{iid} returned {resp.status_code}: {resp.text[:200]}", file=sys.stderr)
 
 
 def sync_mrs(by_stack: dict[str, list[Outdated]]) -> None:
@@ -504,6 +701,7 @@ def sync_mrs(by_stack: dict[str, list[Outdated]]) -> None:
 
         existing = open_mrs.pop(stack, None)
         if existing:
+            iid = existing["iid"]
             if changed:
                 resp = SESSION.put(
                     f"{base}/merge_requests/{existing['iid']}",
@@ -530,7 +728,10 @@ def sync_mrs(by_stack: dict[str, list[Outdated]]) -> None:
                 timeout=15,
             )
             resp.raise_for_status()
-            print(f"  opened MR !{resp.json()['iid']} for {stack}")
+            iid = resp.json()["iid"]
+            print(f"  opened MR !{iid} for {stack}")
+
+        sync_auto_merge(base, headers, stack, iid, auto_mergeable(items))
 
     # Anything still open here has no outdated tag-pinned images left -
     # this run has caught up (or someone bumped it by hand) - so close

@@ -26,7 +26,7 @@ flowchart TB
 
   subgraph gitlab_srv["self-hosted GitLab (runs on tools)"]
     repo["deploy repo\n.gitlab-ci.yml + ci-image/"]
-    runner["deploy-runner\ndocker executor"]
+    runner["k3s-runner\nKubernetes executor, tag docker"]
     repo -->|triggers pipeline| runner
   end
 
@@ -73,6 +73,12 @@ flowchart TB
   the repo root Ansible ignores them silently and the run still exits 0.
 - **`gitlab` is never deployed by CI**, it runs the pipeline. Local runs
   only, via `scripts/deploy_gitlab.sh`.
+- **CI runs on a k3s runner cluster** (Kubernetes executor, jobs tagged
+  `docker`), set up in
+  [j551n-ncloud/k3s-lxc](https://github.com/j551n-ncloud/k3s-lxc). The
+  former docker-executor runner LXCs are gone. A host alias for the
+  registry (`registry.example.com -> 192.0.2.4`) lives in the runner's
+  Helm values.
 - **Adopting a host needs a Proxmox ACL entry**, or its deploy fails
   closed on a `403`.
 

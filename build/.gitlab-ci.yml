@@ -5,17 +5,25 @@
 # images exist isn't hand-maintained anywhere - scripts/discover-images.sh
 # finds every Dockerfile under a changed submodule at run time.
 #
-# Requires a self-hosted GitLab Runner with the "docker" executor,
-# tagged `build` - its own runner, on its own host, deliberately
-# separate from services/deploy's deploy-runner. Two reasons: a stuck or
+# Runs on a `k3s-build-runner` (Kubernetes executor on a k3s cluster,
+# privileged for dind, see https://github.com/j551n-ncloud/k3s-lxc),
+# tagged `build` - its own runner,
+# deliberately separate from services/deploy's `k3s-runner`. Two reasons: a stuck or
 # slow image build here shouldn't be able to queue behind (or in front
 # of) a fleet deploy, and this pipeline only needs LAN access to Harbor,
-# not the deploy SSH key or vault password deploy-runner's jobs handle.
+# not the deploy SSH key or vault password services/deploy's jobs handle.
 # GitHub Actions is not an option either way: Harbor is internal-only
 # and unreachable from its cloud runners.
 #
 # Required CI/CD variables (Settings > CI/CD > Variables, protected):
-#   HARBOR_URL           Variable type. registry.example.com (no scheme).
+#   HARBOR_URL           Variable type. registry.example.com (no scheme):
+#                         Harbor's LAN name, much faster to push to than
+#                         a public name that goes out via a public host.
+#                         The router drops DNS answers for private IPs, so
+#                         it resolves through the runner's host alias
+#                         (host_aliases in the runner's Helm values). Must
+#                         match the registry in services/deploy's image:
+#                         lines, or open_deploy_mr.py finds nothing to bump.
 #   HARBOR_PROJECT        Variable type. The Harbor project (namespace)
 #                         images get pushed under, e.g. "library" -
 #                         must already exist in Harbor, this pipeline
@@ -32,11 +40,16 @@
 #                           since that one is scoped to deploy itself
 #                           and this is a different project calling in.
 #   BUILD_API_TOKEN         Variable type, masked. Project access token
-#                           for THIS project (services/build), Reporter
-#                           role is enough, `api` scope. Used only by the
-#                           scheduled cve-scan job to open/update/close
-#                           the per-image CVE issues. CI_JOB_TOKEN cannot
-#                           create issues, which is why this exists.
+#                           for THIS project (services/build), Developer
+#                           role, `api` scope. Used by the two scheduled
+#                           jobs: cve-scan opens/updates/closes the
+#                           per-image CVE issues, and submodule-check
+#                           pushes a bump/<name> branch and opens the
+#                           merge request that moves a submodule pointer.
+#                           CI_JOB_TOKEN can do neither, which is why
+#                           this exists. Reporter was enough while this
+#                           only wrote issues - the branch and the MR are
+#                           what need Developer.
 #   GIT_SSH_PRIVATE_KEY     File type. Private half of a keypair whose
 #                           public half is registered as a read-only
 #                           deploy key on any project repo that is
@@ -102,8 +115,8 @@ workflow:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
     - when: never
 
-# Every job here needs build-runner specifically: LAN access to Harbor
-# and a privileged host for dind. Landing on services/deploy's deploy-runner
+# Every job here needs k3s-build-runner specifically: LAN access to Harbor
+# and privileged pods for dind. Landing on services/deploy's k3s-runner
 # instead fails in ways that look like anything but a missing tag, so
 # this is a default rather than something to remember per job.
 default:
@@ -133,12 +146,12 @@ default:
 # point: it is the one job here that is safe on a pipeline with none of
 # the protected variables, because it touches no registry and no API.
 #
-# alpine/git + apk rather than python:3.12-slim + apt-get: the tests
-# shell out to git, and apt-get on Debian is precisely what kept hanging
-# on services/deploy's runner and drove both ci-images into existence.
-# The right home for these packages is ci-image/Dockerfile.build, so
-# this job installs nothing at all - until that image is rebuilt, apk
-# is the cheap and reliable half of the problem.
+# build-ci-image, not alpine/git + apk: the tests shell out to git and
+# need python3, py3-yaml and py3-requests, which that image now bakes in
+# (deploy-ci-image's Dockerfile.build), so this job installs nothing.
+# The apk add it used to run once stalled on a mirror fetch with its
+# output in /dev/null and held the whole pipeline for 16 minutes; the
+# timeout turns any such hang into a fast, visible failure instead.
 #
 # py3-requests is needed to import open_deploy_mr.py at all, not just to
 # reach the network: it imports requests at module scope, and the tests
@@ -146,10 +159,9 @@ default:
 test:
   stage: validate
   image:
-    name: alpine/git:latest
+    name: ghcr.io/example-org/build-ci-image:latest
     entrypoint: [""]
-  before_script:
-    - apk add --no-cache python3 py3-yaml py3-requests >/dev/null
+  timeout: 5m
   script:
     - python3 -m unittest discover -s tests -v
   # Runs in every pipeline the workflow allows, merge requests included -
@@ -237,7 +249,7 @@ detect-changes:
     # changes rarely, and re-pulling ~230MB before every job just to
     # then wait up to 30s for "services to be up and running" adds
     # real time for no benefit once it's already cached on
-    # build-runner. build-ci-image itself still pulls :latest fresh
+    # the k3s node. build-ci-image itself still pulls :latest fresh
     # (the job's own `image:` isn't touched here) since a fix pushed
     # there should take effect on the very next run.
     - name: docker:27-dind
@@ -313,8 +325,10 @@ detect-changes:
     # Single-purpose trusted runner, only ever fetching this project's
     # own registered submodules - safe to re-allow.
     - git config --global protocol.file.allow always
-    # build-runner reuses its workspace across job runs (this repo's
-    # default GIT_STRATEGY is fetch, not clone) - a submodule left in a
+    # The former LXC runner reused its workspace across job runs (this
+    # repo's default GIT_STRATEGY is fetch, not clone); on the Kubernetes
+    # executor every job starts in a fresh pod, so this is now a cheap
+    # safety net. A submodule left in a
     # broken state by an earlier failed attempt (a stale gitlink, a
     # remote missing because a prior run got killed mid-fetch) would
     # otherwise poison every run after it. Deinit + wipe first so this
@@ -340,9 +354,14 @@ detect-changes:
     # not fatal: build-images.sh checks for a working builder and falls
     # back to a plain uncached build, so a missing or broken buildx
     # makes this pipeline slow rather than red.
+    #
+    # network=host: the builder is its own container inside dind and pushes
+    # to Harbor itself. On dind's network it would get Docker's generated
+    # /etc/hosts and miss the runner's host alias for HARBOR_URL;
+    # with host networking it shares dind's, which has it.
     - |
       if [ "${BUILD_CACHE:-true}" = "true" ]; then
-        docker buildx create --name harbor-cache --driver docker-container --use >/dev/null 2>&1 \
+        docker buildx create --name harbor-cache --driver docker-container --driver-opt network=host --use >/dev/null 2>&1 \
           || echo "buildx unavailable - builds will run uncached."
       fi
   after_script:

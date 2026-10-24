@@ -17,6 +17,22 @@ if [ ! -d "$sub" ]; then
   exit 1
 fi
 
+# This script pushes the submodule's main but commits whatever its HEAD
+# points at. In detached HEAD those disagree, and the bump silently moves
+# the pointer to the checked-out commit instead of the pushed tip.
+head_ref="$(git -C "$sub" symbolic-ref --quiet --short HEAD || true)"
+if [ "$head_ref" != "main" ]; then
+  if [ -n "$head_ref" ]; then
+    at="on '$head_ref'"
+  else
+    at="detached at $(git -C "$sub" rev-parse --short HEAD)"
+  fi
+  echo "$sub is not on main ($at)." >&2
+  echo "this script pushes main but commits HEAD - they would disagree." >&2
+  echo "run: git -C $sub checkout main" >&2
+  exit 1
+fi
+
 # One push target: GitLab. Each submodule's GitLab project push-mirrors
 # to GitHub (scripts/add-mirror.sh), so there is nothing to fan out to
 # here.

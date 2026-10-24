@@ -4,6 +4,7 @@ assertions about properties that are easy to drop in an edit and whose
 loss is invisible until something ships wrong.
 """
 import os
+import re
 import unittest
 
 import yaml
@@ -112,9 +113,55 @@ class PipelineTest(unittest.TestCase):
             for forbidden in ("docker push", "docker build", "buildx", "open_deploy_mr"):
                 self.assertNotIn(forbidden, script, f"{name}: {forbidden}")
 
+    def test_every_job_runs_a_script_that_exists(self):
+        """A script renamed without its caller leaves a job that is green
+        in the editor and ImportError-shaped at 03:00 on a schedule
+        nobody is watching."""
+        for name in self.jobs:
+            body = "\n".join(self.shell(name, k)
+                              for k in ("before_script", "script", "after_script"))
+            for ref in sorted(set(re.findall(r"scripts/[\w.-]+", body))):
+                self.assertTrue(os.path.exists(os.path.join(REPO, ref)),
+                                f"{name} runs {ref}, which does not exist")
+
+    def test_scheduled_scripts_never_touch_services_deploy(self):
+        """The schedule allowance rests on these two reaching neither
+        Harbor nor services/deploy. submodule-check opens a merge request
+        now, which is only safe while the project it opens it against is
+        this one - an MR on services/deploy is a redeploy waiting for one
+        click, and a timer must not queue those up."""
+        for name in ("cve-scan", "submodule-check"):
+            body = "\n".join(self.shell(name, k)
+                              for k in ("before_script", "script", "after_script"))
+            for ref in sorted(set(re.findall(r"scripts/[\w.-]+", body))):
+                full = os.path.join(REPO, ref)
+                if not os.path.exists(full):
+                    continue      # the test above is the one that reports this
+                with open(full) as f:
+                    source = f.read()
+                for forbidden in ("DEPLOY_API_TOKEN", "DEPLOY_PROJECT_PATH", "docker "):
+                    self.assertNotIn(forbidden, source, f"{name} runs {ref}: {forbidden}")
+
+    def test_the_scheduled_bump_never_merges_its_own_mr(self):
+        """main is Maintainer+ to push but Developer+ to merge, and the
+        token this job runs as is a Developer - so GitLab would let it
+        merge what it opens. Nothing in the script does, and this is what
+        keeps it that way: a human clicking merge is the only thing left
+        between a timer and a Harbor push."""
+        with open(os.path.join(REPO, "scripts", "bump_submodules.py")) as f:
+            lines = f.read().splitlines()
+        # Line at a time: matching the whole file means a failure prints
+        # the whole file, and the one line that did it is the thing you
+        # need to see.
+        for n, line in enumerate(lines, 1):
+            for forbidden in ('/merge"', "/merge'", "merge_when_pipeline_succeeds",
+                              "auto_merge", "merge_immediately"):
+                self.assertNotIn(forbidden, line,
+                                 f"bump_submodules.py:{n} would merge its own MR")
+
     def test_every_job_runs_on_the_build_runner(self):
         """This pipeline needs LAN access to Harbor and a privileged
-        host for dind. Landing on services/deploy's deploy-runner instead
+        host for dind. Landing on services/deploy's k3s-runner instead
         fails in ways that look like anything but a missing tag."""
         self.assertEqual(self.doc["default"]["tags"], ["build"])
         for name in self.jobs:

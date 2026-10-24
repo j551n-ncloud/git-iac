@@ -88,7 +88,7 @@ sed 's/^/  /' "$images"
 # Capability-checked rather than assumed: if buildx or its builder
 # isn't there, this falls back to a plain build instead of failing, so
 # a missing cache is slow rather than broken. That fallback is also the
-# only path verified end to end against build-runner today.
+# only path verified end to end against the former LXC runner.
 use_buildx=0
 if [ "${BUILD_CACHE:-true}" = "true" ] && "$docker" buildx inspect >/dev/null 2>&1; then
   use_buildx=1
@@ -142,7 +142,7 @@ while read -r name ctx sub; do
   echo "building $name from $ctx (submodule $sub @ $rev)"
   cache_ref="$HARBOR_URL/$HARBOR_PROJECT/$name:buildcache"
   if [ "$use_buildx" -eq 1 ]; then
-    # --pull, always. build-runner caches base layers across jobs, so
+    # --pull, always. A runner can cache base layers across jobs, so
     # without it a rebuild of an unchanged Dockerfile silently keeps
     # whatever `FROM debian:trixie` resolved to the first time. Nearly
     # every commit in this repo is base-image CVE work, which is exactly

@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""A GitLab REST API stand-in, just enough of it for open_deploy_mr.py.
+"""A GitLab REST API stand-in, just enough of it for open_deploy_mr.py
+and bump_submodules.py.
 
 Models the parts whose *interaction* is where the bugs live: branches
 that outlive their merge request, `start_branch` being valid only on a
 branch that doesn't exist yet, and a file's content differing between
 main and a branch cut from an older main.
+
+Gitlinks are tracked alongside files because a submodule bump is not a
+file edit - GitLab reports one as a tree entry of type "commit" and
+writes it through its own Submodules endpoint.
 """
 import json
 import re
@@ -29,11 +34,14 @@ class Response:
 
 
 class FakeGitLab:
-    """branches: {branch: {path: content}}. 'main' must exist."""
+    """branches: {branch: {path: content}}, gitlinks: {branch: {path: sha}}.
+    'main' must exist in both."""
 
-    def __init__(self, main_files):
+    def __init__(self, main_files, main_gitlinks=None):
         self.branches = {"main": dict(main_files)}
+        self.gitlinks = {"main": dict(main_gitlinks or {})}
         self.mrs = []
+        self.notes = {}
         self.next_iid = 1
         self.calls = []
 
@@ -48,6 +56,14 @@ class FakeGitLab:
     def commit_to_main(self, path, content):
         """An unrelated change landing on main after a branch was cut."""
         self.branches["main"][path] = content
+
+    def gitlink(self, branch, path):
+        return self.gitlinks.get(branch, {}).get(path)
+
+    def _fork(self, src, dst):
+        """A new branch is a copy of its ref, gitlinks included."""
+        self.branches[dst] = dict(self.branches[src])
+        self.gitlinks[dst] = dict(self.gitlinks.get(src, {}))
 
     # --- the transport ----------------------------------------------------
 
@@ -83,8 +99,12 @@ class FakeGitLab:
             if ref not in self.branches:
                 return Response(404, {})
             names = sorted({p for p in self.branches[ref] if p.startswith(prefix)})
-            return Response(200, [{"path": p, "type": "blob", "name": p.rsplit("/", 1)[-1]}
-                                  for p in names])
+            out = [{"path": p, "type": "blob", "name": p.rsplit("/", 1)[-1]}
+                   for p in names]
+            out += [{"path": p, "type": "commit", "id": sha, "name": p.rsplit("/", 1)[-1]}
+                    for p, sha in sorted(self.gitlinks.get(ref, {}).items())
+                    if p.startswith(prefix)]
+            return Response(200, out)
 
         if tail == "merge_requests":
             src, state = params.get("source_branch"), params.get("state")
@@ -108,13 +128,27 @@ class FakeGitLab:
             if start is not None:
                 if start not in self.branches:
                     return Response(400, {"message": "start_branch missing"})
-                self.branches[branch] = dict(self.branches[start])
+                self._fork(start, branch)
             elif branch not in self.branches:
                 return Response(400, {"message": "Branch Not Found"})
             for action in payload["actions"]:
                 assert action["action"] == "update"
                 self.branches[branch][action["file_path"]] = action["content"]
             return Response(201, {"id": "deadbeef"})
+
+        if tail == "repository/branches":
+            branch, ref = data["branch"], data["ref"]
+            if branch in self.branches:
+                return Response(400, {"message": "Branch already exists"})
+            if ref not in self.branches:
+                return Response(400, {"message": "Invalid reference name"})
+            self._fork(ref, branch)
+            return Response(201, {"name": branch})
+
+        m = re.fullmatch(r"merge_requests/(\d+)/notes", tail)
+        if m:
+            self.notes.setdefault(int(m.group(1)), []).append(data["body"])
+            return Response(201, {"id": 1})
 
         if tail == "merge_requests":
             mr = {
@@ -134,6 +168,15 @@ class FakeGitLab:
     def put(self, url, headers=None, json=None, data=None, timeout=None):
         method, tail, _ = self._route("PUT", url)
         self.calls.append((method, tail))
+
+        m = re.fullmatch(r"repository/submodules/(.+)", tail)
+        if m:
+            path, branch = unquote(m.group(1)), data["branch"]
+            if branch not in self.branches:
+                return Response(400, {"message": "Branch Not Found"})
+            self.gitlinks.setdefault(branch, {})[path] = data["commit_sha"]
+            return Response(200, {"id": "deadbeef"})
+
         m = re.fullmatch(r"merge_requests/(\d+)", tail)
         if m:
             iid = int(m.group(1))
@@ -156,6 +199,7 @@ class FakeGitLab:
                 return Response(403, {"message": "protected"})
             if branch in self.branches:
                 del self.branches[branch]
+                self.gitlinks.pop(branch, None)
                 return Response(204, {})
             return Response(404, {})
         raise AssertionError(f"unrouted DELETE {tail}")

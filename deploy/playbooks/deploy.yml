@@ -39,6 +39,25 @@
     # for why that needed a role of its own. Both roles feed the same
     # stack_results fact, so the summary play below covers either kind.
     - git_stack
+  post_tasks:
+    # Once per host after BOTH roles, so a git_stack-only deploy (glance)
+    # cleans up too. -a, not just dangling: a version bump leaves the old
+    # image tagged (homepage:2.5.2 after moving to 2.5.3), which a
+    # dangling-only prune never removed. Images of stopped containers stay,
+    # because those containers still reference them; rolling back a bad
+    # update goes through the pre-deploy Proxmox snapshot.
+    #
+    # Docker CLI rather than community.docker.docker_prune: that one needs
+    # the Python docker SDK (requests) on the target, which the Alpine
+    # hosts don't have - it once aborted website mid-deploy. Hosts without
+    # stacks (VPN, FLARE) have no docker at all and are skipped.
+    - name: Prune images no container uses
+      ansible.builtin.command: docker image prune -af
+      register: prune_result
+      changed_when: "'Total reclaimed space: 0B' not in prune_result.stdout"
+      when:
+        - docker_compose_prune | default(false)
+        - (stacks | default([]) | length > 0) or (git_stacks | default([]) | length > 0)
 
 # One consolidated report at the end, so the outcome of a multi-host,
 # multi-stack run doesn't have to be pieced together by scrolling back

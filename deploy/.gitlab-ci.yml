@@ -1,6 +1,7 @@
 ---
-# Requires a self-hosted GitLab Runner with the "docker" executor,
-# tagged `docker` (adjust `tags:` below if yours differs).
+# Runs on a self-hosted GitLab Runner with the Kubernetes executor on a
+# k3s cluster (see https://github.com/j551n-ncloud/k3s-lxc), tagged
+# `docker` (adjust `tags:` below if yours differs).
 #
 # RUNNER PLACEMENT MATTERS: the runner must not live on a host this
 # pipeline deploys to. Recreating a stack on the runner's own host can
@@ -22,9 +23,11 @@
 #   PROXMOX_TOKEN_ID        Variable type. e.g. deploy@pve!ci
 #   PROXMOX_TOKEN_SECRET    Variable type, masked. The token's secret.
 #   GITLAB_API_TOKEN        Variable type, masked. Project access token
-#                           (Settings > Access Tokens), Developer role,
-#                           `api` scope. Used only by check-image-updates,
-#                           to open/update merge requests and issues -
+#                           (Settings > Access Tokens), Maintainer role
+#                           (a Developer can't merge into protected
+#                           main), `api` scope. Used only by
+#                           check-image-updates, to open/update/auto-merge
+#                           merge requests and issues -
 #                           CI_JOB_TOKEN returns 401 against this
 #                           instance's Issues API, so a real token is
 #                           required rather than the job token. `api`
@@ -66,7 +69,8 @@ stages:
 
 variables:
   ANSIBLE_FORCE_COLOR: "1"
-  # GitLab's docker executor creates /builds world-writable, and Ansible
+  # GitLab's runners can create /builds world-writable (the docker
+  # executor of the former LXC runners did), and Ansible
   # refuses to load an ansible.cfg it finds in a world-writable
   # directory. Without this the repo's ansible.cfg is silently ignored:
   # roles_path is lost (role 'docker_stack' not found) and
@@ -279,8 +283,9 @@ preflight:
       when: never
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
-# Works out what this push actually changed, so auto-deploy can touch
-# only the affected stacks instead of recreating the whole fleet.
+# Works out what changed since the last successful auto-deploy, so
+# auto-deploy can touch only the affected stacks instead of recreating
+# the whole fleet.
 #
 # Emits a dotenv artifact with AUTO_STACKS and AUTO_HOSTS, which GitLab
 # injects as variables into the auto-deploy job below. Both are empty
@@ -299,10 +304,20 @@ detect-changes:
     # step needed here any more.
     - |
       set -eu
-      # CI_COMMIT_BEFORE_SHA is all-zeros on the first push to a branch,
-      # and stale after a force push. Fall back to the commit's own
-      # parent, which is what "what did this push change" means anyway.
-      base="${CI_COMMIT_BEFORE_SHA:-}"
+      # Diff from the last commit auto-deploy succeeded on, so a push
+      # whose pipeline was auto-canceled or failed still gets deployed
+      # by the next one (see scripts/last_deployed_sha.py). Only used if
+      # it is an ancestor of this commit, which a force push can break.
+      base="$(python3 scripts/last_deployed_sha.py)"
+      if [ -n "$base" ] && ! git merge-base --is-ancestor "$base" "$CI_COMMIT_SHA" 2>/dev/null; then
+        echo "last deployed $base is not an ancestor of this commit - ignoring it."
+        base=""
+      fi
+      # Otherwise the old per-push range. CI_COMMIT_BEFORE_SHA is
+      # all-zeros on the first push to a branch, and stale after a force
+      # push. Fall back to the commit's own parent, which is what "what
+      # did this push change" means anyway.
+      [ -n "$base" ] || base="${CI_COMMIT_BEFORE_SHA:-}"
       case "$base" in
         ''|0000000000000000000000000000000000000000) base="" ;;
       esac
@@ -314,8 +329,8 @@ detect-changes:
       echo "diff range: $range"
       git diff --name-only "$range" > changed.txt
       sed 's/^/  /' changed.txt
-      # Each `- |` below is its own shell, so the base ref has to be
-      # handed over in a file rather than an env var.
+      # Handed over in a file so the later blocks don't depend on
+      # this one's shell variables.
       printf '%s' "${range%%..*}" > diff_base.txt
     - |
       set -eu
@@ -398,10 +413,14 @@ detect-changes:
     reports:
       dotenv: deploy.env
     expire_in: 1 week
+  # Push only. A pipeline started by hand or via the API has
+  # CI_COMMIT_BEFORE_SHA all-zeros, so the fallback above would diff
+  # HEAD~1..HEAD and auto-deploy would redeploy the last commit's stacks,
+  # taking (and pruning) a snapshot for nothing. Merged MRs are pushes.
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
       when: never
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
 
 # --- deploy -----------------------------------------------------------
 
@@ -493,10 +512,11 @@ auto-deploy:
         -e snapshot_before_deploy=true \
         -e @.proxmox.json \
         --vault-password-file .vault_pass.txt
+  # Push only, same as detect-changes (see there).
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
       when: never
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
   needs:
     - lint
     - compose-lint
@@ -509,9 +529,15 @@ auto-deploy:
 # upstream. A plain tag-pinned image gets a merge request with the bump
 # already applied, one per stack - merging it is the whole action, and
 # (like any other compose change on main) redeploys that stack right
-# away. A digest-pinned image (auth, for instance - pinned that way on
-# purpose, with a comment explaining why a routine bump doesn't apply)
-# only ever gets an issue, never a one-click MR.
+# away. A digest-pinned image (auth, for instance - each
+# pinned that way on purpose, with a comment explaining why a routine
+# bump doesn't apply) only ever gets an issue, never a one-click MR.
+# An MR whose bumps are all patch or minor (same major version) is set
+# to merge when its pipeline succeeds, so it reaches production via
+# auto-deploy with no manual merge. Any major bump holds the MR for a
+# human. Known gap: MR pipelines run only lint and compose-lint, not
+# preflight, so a bump that breaks at runtime deploys unreviewed and
+# the Proxmox snapshot auto-deploy takes first is the rollback.
 # Runs only from the "check-image-updates" pipeline schedule (Settings >
 # CI/CD > Schedules, SCHEDULE_TASK=check-image-updates, cron e.g.
 # "0 6 * * *") - never from a push or MR. Every job above carries a
@@ -525,8 +551,9 @@ auto-deploy:
 #
 # Never runs ansible-playbook or touches a host directly - anything it
 # does lands as a commit on an image-update/<stack> branch or an issue,
-# both labelled "image-update". Actually reaching production still goes
-# through a human merging that MR, same as any other change.
+# both labelled "image-update". Reaching production still goes through
+# merging that MR (auto-merge for patch/minor, a human otherwise), then
+# auto-deploy, and gitlab stays in FORBIDDEN_STACKS either way.
 check-image-updates:
   stage: check
   # requests is already in the ci-image (see .ansible_base) - this job

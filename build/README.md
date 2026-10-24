@@ -22,7 +22,7 @@ flowchart TB
   subgraph gitlab_srv["self-hosted GitLab"]
     src["projects/&lt;name&gt; source repos\ndashboard (private, SSH) + docs-site"]
     repo["build repo\n.gitlab-ci.yml + submodules"]
-    runner["build-runner\nprivileged, docker-in-docker"]
+    runner["k3s-build-runner\nKubernetes executor on k3s\nprivileged pods, docker-in-docker"]
     repo -->|push to main| runner
   end
 
@@ -45,7 +45,7 @@ flowchart TB
   runner -->|build-and-push| images
   runner -->|open-deploy-mr\none MR per stack| deployrepo
   trivy -.->|cve-scan reads results\ndaily 07:00, issue per image| repo
-  src -.->|submodule-check compares pins\ndaily 07:30, issue if behind| repo
+  src -.->|submodule-check compares pins\ndaily 07:30, MR if behind| repo
   deployrepo -->|merge -> auto-deploy| fleet["the host that runs it"]
 ```
 
@@ -58,29 +58,104 @@ flowchart TB
 | Ship a change | `scripts/sync-submodule.sh <name> "message"` |
 | Rebuild without a change | manual `rebuild` job, `REBUILD_SUBMODULES=<name>` |
 | Run the tests | `python3 -m unittest discover -s tests` |
-| Daily checks | `cve-scan` 07:00, `submodule-check` 07:30, both open issues |
+| Daily checks | `cve-scan` 07:00 opens issues, `submodule-check` 07:30 opens a bump MR |
 
 Nothing hand-lists which images exist, a tracked `Dockerfile` under a
 submodule is the only registration one needs.
 
-## The sample projects
+## How it works
 
-`.gitmodules` is the registry every other moving part enumerates from.
-Upstream each entry is a real git submodule; here the two entries are
-checked in under `projects/` directly, so the fork is clonable and the
-pipeline runnable without access to a private repo.
+### The unit of change is a pointer
 
-They exist to cover the two shapes discovery has to handle:
+Source lives in its own repos and appears here as submodules under
+`projects/`. This repo stores only a SHA per submodule, the gitlink, and
+moving that SHA is what triggers everything else.
 
-| Project | Shape | Images produced |
+That choice shapes the pipeline. `git diff --name-only` reports a
+submodule as a change to its own path, never to a file inside it, so
+`detect-changes` learns which submodule moved without fetching any
+submodule content, which matters because `dashboard` is private and needs
+an SSH identity to fetch at all. The cost is that it cannot tell what
+inside one moved either, so a multi-image submodule rebuilds all of its
+images whenever its pointer moves.
+
+It also means a pointer moved backwards silently un-ships a change:
+nothing fails, the pipeline is green, and the fix simply is not in the
+image. `sync-submodule.sh` refuses to bump from a detached HEAD for
+that reason, and `submodule-check` proposes bumps as a merge request
+rather than as commands to retype.
+
+### What a push to main does
+
+| Stage | Job | |
 |---|---|---|
-| `projects/docs-site` | one `Dockerfile` at the project root | `docs-site` |
-| `projects/dashboard` | nested `Dockerfile`s, a monorepo | `dashboard-api`, `dashboard-worker` |
+| `validate` | `test` | stdlib unittest, and the only job a merge request runs |
+| `detect` | `detect-changes` | diffs the push range against `.gitmodules`, writes `changed_submodules.txt` |
+| `build` | `build-and-push` | checks out submodules over SSH, builds, pushes to Harbor |
+| `open-mr` | `open-deploy-mr` | bumps the pins in `services/deploy`, one merge request per stack |
 
-Both `Dockerfile`s reference the dated `APT_REFRESH`/`APK_REFRESH` build
-arg that `build-images.sh` passes, which is what makes a rebuild pick up
-base-OS security fixes rather than restoring a byte-identical cached
-layer. Copy that pattern into real projects.
+Merging that merge request is what redeploys, via deploy's own
+auto-deploy.
+
+### How an image gets its name and tag
+
+`discover-images.sh` names an image after its submodule, or
+`<submodule>-<subdir>` when the `Dockerfile` is nested. Two contexts
+resolving to one name is an error rather than a warning, both would
+push the same Harbor tag.
+
+`build-images.sh` tags each image with the submodule's own short commit
+SHA, and skips the build when Harbor already holds that tag, so the
+same source is a no-op however often it runs. `FORCE_REBUILD=true`
+overrides that, which is right for a rebuild against a patched base
+image and wrong under a stack that already deployed the tag.
+
+Two files carry the result forward: `built_images.env` for the image
+tags, `built_submodules.tsv` for the checkout pins. `open_deploy_mr.py`
+bumps both, and only ever edits something already pointing at this
+exact artifact, never creating a stack and never guessing.
+
+### Two ways to build, one code path
+
+`build-and-push` runs on a push, `rebuild` is the manual lever
+(`REBUILD_SUBMODULES`, `FORCE_REBUILD`) so recovering never requires an
+empty submodule bump. Both run `build-images.sh`.
+
+`open-deploy-mr` names neither in `needs:`. A manual job named there
+skips its dependents whenever nobody plays it, so this one waits on
+stage order instead and collects artifacts from whichever producer
+actually ran.
+
+### Why the rules look paranoid
+
+A push to `main` is the thing that publishes, so what may cause one is
+the whole of this repo's security surface. A scheduled pipeline still
+has `CI_COMMIT_BRANCH == main`, so without an explicit refusal it would
+satisfy `.main_only` and start pushing images on a timer. Hence the
+workflow rules letting a schedule create a pipeline for only the two
+named tasks, the separate `schedule -> never` guard on every publishing
+job on top of that, and `tests/test_pipeline.py` asserting both halves
+so neither can be quietly dropped in an edit.
+
+The same reasoning covers the rest. Merge request pipelines run `test`
+only. `resource_group` serialises registry pushes and merge request
+writes, separately, so neither queues behind the other. The daily bump
+opens a merge request and never commits to `main`, and a test keeps it
+from merging what it opens. Jobs are deliberately not `interruptible`,
+because `detect-changes` only diffs its own push range, so a cancelled
+pipeline would take an unbuilt bump with it.
+
+## Why GitLab CI and not GitHub Actions
+
+Harbor is internal-only. GitHub's cloud runners cannot reach it, and
+exposing it just to let one push isn't worth doing. So the build runs on
+a self-hosted runner on the same network, tag `build`:
+a `k3s-build-runner` on a k3s cluster (Kubernetes executor, privileged
+pods for dind), set up in
+[j551n-ncloud/k3s-lxc](https://github.com/j551n-ncloud/k3s-lxc), separate
+from `deploy`'s `k3s-runner` so a slow image build never queues behind a
+fleet deploy. It replaced docker-executor runner LXCs; a host alias for
+`registry.example.com -> 192.0.2.4` is part of its config.
 
 ## What to change if you fork this
 

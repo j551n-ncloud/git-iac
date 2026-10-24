@@ -12,6 +12,10 @@
 - name: Create the deploy user
   ansible.builtin.user:
     name: "{{ deploy_user }}"
+    # Only set where files were copied from another host and must keep
+    # their owner (host-c, host-x: 1003 like tools). Elsewhere the
+    # account keeps whatever uid it was created with.
+    uid: "{{ deploy_user_uid | default(omit) }}"
     groups: docker
     append: true
     shell: "{{ deploy_user_shell }}"

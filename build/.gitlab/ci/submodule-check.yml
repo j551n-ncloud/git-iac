@@ -1,12 +1,26 @@
 ---
 # Daily check for submodules whose source has moved past the pointer
-# here. A submodule only moves when someone runs sync-submodule.sh, so a
-# commit pushed straight to the source repo leaves this repo stale and
-# nothing builds from it.
+# here, opening a merge request per stale one that does the bump.
 #
-# Schedule: SCHEDULE_TASK=submodule-check. Needs no submodules checked
-# out and no Docker - just git ls-remote, which for the private dashboard
-# repo needs the SSH key.
+# A submodule only moves when someone bumps its gitlink, so a commit
+# pushed straight to the source repo leaves this repo stale and nothing
+# builds from it. This used to open an issue listing the commands to
+# run by hand; the bump is now a ready-made MR instead, because the
+# hand-run recipe named a SHA that went stale while the issue sat open
+# and walked the pointer backwards (a stale pin).
+#
+# It opens a merge request and never commits to main. A push to main
+# builds images, pushes to Harbor and writes to services/deploy, which
+# is exactly what the workflow rules keep a timer away from; an MR
+# reaches none of it, since merge request pipelines run `test` only.
+# tests/test_pipeline.py holds both halves of that to account.
+#
+# Schedule: SCHEDULE_TASK=submodule-check. The job keeps that name so
+# the existing schedule variable still matches - renaming it would make
+# the schedule quietly create no pipeline at all.
+#
+# Needs no submodules checked out and no Docker - just git ls-remote,
+# which for the private dashboard repo needs the SSH key.
 submodule-check:
   stage: scan
   image: ghcr.io/example-org/build-ci-image:latest
@@ -22,4 +36,4 @@ submodule-check:
     - ssh-keyscan -t rsa,ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
     - ssh-keyscan -p 2224 -t rsa,ed25519 ssh.gitlab.example.com >> ~/.ssh/known_hosts 2>/dev/null
   script:
-    - python3 scripts/check_submodules.py
+    - python3 scripts/bump_submodules.py

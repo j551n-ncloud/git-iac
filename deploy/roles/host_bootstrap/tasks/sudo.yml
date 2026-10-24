@@ -7,10 +7,28 @@
 # directory to the deploy user and dropping `become: true` is the
 # better end state wherever that's possible.
 
+- name: Install sudo (minimal LXC templates, e.g. Debian 13, ship without it)
+  ansible.builtin.package:
+    name: sudo
+    state: present
+  # git_stacks count too (a git_stack on host-x runs with become), and
+  # deploy_user_sudo covers hosts whose stacks don't need it but another
+  # playbook does (tools: deploy_gitlab_config.yml writes gitlab.rb).
+  when: >-
+    (deploy_user_sudo | default(false) | bool) or
+    ((stacks | default([])) + (git_stacks | default([])))
+    | selectattr('become', 'defined') | selectattr('become') | list | length > 0
+
 - name: "Grant the deploy user passwordless sudo (only for become: true stacks)"
   ansible.builtin.copy:
     dest: /etc/sudoers.d/{{ deploy_user }}-deploy
     content: "{{ deploy_user }} ALL=(root) NOPASSWD:ALL\n"
     mode: "0440"
     validate: "visudo -cf %s"
-  when: stacks | default([]) | selectattr('become', 'defined') | selectattr('become') | list | length > 0
+  # git_stacks count too (a git_stack on host-x runs with become), and
+  # deploy_user_sudo covers hosts whose stacks don't need it but another
+  # playbook does (tools: deploy_gitlab_config.yml writes gitlab.rb).
+  when: >-
+    (deploy_user_sudo | default(false) | bool) or
+    ((stacks | default([])) + (git_stacks | default([])))
+    | selectattr('become', 'defined') | selectattr('become') | list | length > 0

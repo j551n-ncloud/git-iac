@@ -93,19 +93,3 @@
       loop_control:
         loop_var: stack
         label: "{{ stack.name }}"
-
-    # Once per host after every stack, not once per stack - it prunes the
-    # whole host either way, so doing it per stack was just repeated work.
-    #
-    # Uses the docker CLI rather than community.docker.docker_prune,
-    # which talks to the API through the Python docker SDK and so needs
-    # `requests` installed on the target. Alpine hosts here don't have
-    # it, and that failure aborted the whole host mid-deploy: on the
-    # first run it aborted a multi-stack host after its first stack,
-    # so the rest never deployed. The CLI is already a hard requirement
-    # anyway.
-    - name: Prune dangling images
-      ansible.builtin.command: docker image prune -f
-      register: prune_result
-      changed_when: "'Total reclaimed space: 0B' not in prune_result.stdout"
-      when: docker_compose_prune | default(false)
