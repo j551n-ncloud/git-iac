@@ -1,0 +1,62 @@
+---
+# Installs a pinned k3s server and keeps /etc/rancher/k3s/config.yaml and
+# registries.yaml as described here. The LXC itself (privileged, raw lxc.*
+# lines, host kernel modules) comes from provision.yml (lxc_raw_config in
+# group_vars/platform_k3s) and playbooks/proxmox.yml.
+
+# k3s's kubelet wants /dev/kmsg, which a privileged LXC doesn't have.
+- name: /dev/kmsg link at boot
+  ansible.builtin.copy:
+    dest: /etc/tmpfiles.d/kmsg.conf
+    content: "L /dev/kmsg - - - - /dev/console\n"
+    mode: "0644"
+  register: k3s_kmsg
+
+- name: /dev/kmsg link now
+  ansible.builtin.command: systemd-tmpfiles --create /etc/tmpfiles.d/kmsg.conf
+  when: k3s_kmsg.changed
+
+- name: Config directory
+  ansible.builtin.file:
+    path: /etc/rancher/k3s
+    state: directory
+    mode: "0755"
+
+- name: config.yaml
+  ansible.builtin.template:
+    src: config.yaml.j2
+    dest: /etc/rancher/k3s/config.yaml
+    mode: "0600"
+  diff: false      # holds the join token
+  no_log: true
+  notify: Restart k3s
+
+- name: registries.yaml (only with k3s_registry_mirrors)
+  ansible.builtin.template:
+    src: registries.yaml.j2
+    dest: /etc/rancher/k3s/registries.yaml
+    mode: "0644"
+  when: k3s_registry_mirrors | length > 0
+  notify: Restart k3s
+
+- name: Installed k3s version
+  ansible.builtin.command: /usr/local/bin/k3s --version
+  register: k3s_installed
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# The installer reads config.yaml, so it runs after it. On a version
+# change it replaces the binary and restarts k3s itself.
+- name: Install k3s {{ k3s_version }}
+  ansible.builtin.shell: curl -sfL https://get.k3s.io | sh -s - server
+  environment:
+    INSTALL_K3S_VERSION: "{{ k3s_version }}"
+  when: k3s_version not in (k3s_installed.stdout | default(''))
+  notify: Wait for the node to be Ready
+
+- name: k3s enabled and running
+  ansible.builtin.systemd_service:
+    name: k3s
+    state: started
+    enabled: true

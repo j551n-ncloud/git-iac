@@ -1,0 +1,31 @@
+---
+# OPTIONAL k3s path. k3s servers with embedded etcd; this role only
+# installs and configures k3s on the nodes. What runs IN the cluster
+# (the gitlab-runner chart, k3s/gitlab-runner.values.yaml.example) is
+# applied with helm afterwards.
+#
+# Pin the version on purpose, and check https://github.com/k3s-io/k3s/releases
+# for a current stable release before the first run. Upgrade: change it,
+# run playbooks/k3s.yml.
+k3s_version: v1.36.5+k3s1
+
+# k3s components to switch off. Empty keeps k3s's defaults (Traefik,
+# ServiceLB). A runner cluster needs neither, so they are off here.
+k3s_disable: [traefik, servicelb]
+
+# The first server in [platform_k3s] starts the cluster (cluster-init, no
+# server: line). Every other server joins through it. If you ever have
+# to rebuild the first node from scratch, move another node to the top
+# of the group first, or it would start a new, separate cluster.
+k3s_init_node: "{{ groups['platform_k3s'] | first }}"
+k3s_server_url: "https://{{ hostvars[k3s_init_node].ansible_host }}:6443"
+k3s_tls_san: >-
+  {{ groups['platform_k3s'] + (groups['platform_k3s'] | map('extract', hostvars, 'ansible_host') | list) }}
+
+# containerd registry mirrors for /etc/rancher/k3s/registries.yaml, e.g. a
+# pull-through cache. Empty (the default) means no registries.yaml.
+#   k3s_registry_mirrors:
+#     docker.io:
+#       endpoint: ["https://registry.example.com"]
+#       rewrite: {"^(.*)$": "dockerhub/$1"}
+k3s_registry_mirrors: {}

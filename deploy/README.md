@@ -113,6 +113,18 @@ CI/CD variables (`ANSIBLE_VAULT_PASSWORD`, `SSH_PRIVATE_KEY`,
 `PROXMOX_*`, `GITLAB_API_TOKEN`) are documented in the header of
 `.gitlab-ci.yml`. None of them are baked into a tracked file.
 
+## Reading the infra inventory
+
+This sample ships its own `inventory/hosts.ini`. The [`infra`](../infra)
+repo owns the host list in the full setup: set
+`inventory = ../infra/inventory, inventory/` in `ansible.cfg` and have CI
+clone infra next to this repo with the job token, and this repo's
+`inventory/` only adds stack variables and secrets. Secrets follow one
+pattern: `inventory/group_vars/production/vault_<stack>.yml`, one file per
+stack with one `!vault` value per key, committed only as `.yml.example`.
+See [infra/README.md](../infra/README.md#how-deploy-reads-this-inventory)
+and the [tutorial](../docs/proxmox-tutorial.md).
+
 ## Documentation
 
 | | |

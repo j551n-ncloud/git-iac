@@ -1,0 +1,24 @@
+---
+# Copy to host_vars/<host>.yml ONLY where one host really differs from
+# its group. Every key below is optional; the comment says what it does.
+
+# No sudo for this host's deploy user, even though [base] asks for it.
+# base.yml and patch.yml then have to run as root (see playbooks/base.yml).
+# deploy_user_sudo: false
+
+# Keep file ownership when data was copied over from another machine.
+# deploy_user_uid: 1003
+
+# Packages apt must not upgrade unplanned (apt-mark hold). patch.yml and
+# dist_upgrade.yml leave them alone, and dist_upgrade skips the host.
+# apt_holds:
+#   - docker-ce
+#   - docker-ce-cli
+#   - containerd.io
+
+# Extra packages for this host on top of roles/base's list.
+# extra_packages: [ncdu]
+
+# Units patch.yml waits for after an upgrade.
+# patch_services:
+#   - tailscaled

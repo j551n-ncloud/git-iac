@@ -1,0 +1,17 @@
+---
+# OPTIONAL k3s path. k3s in LXC needs a privileged container (overlay,
+# br_netfilter, /dev/kmsg).
+lxc_cores: 2
+lxc_memory: 8192
+lxc_swap: 0
+lxc_disk_gb: 40
+lxc_unprivileged: false
+lxc_features: "nesting=1"
+# Raw lxc.* lines k3s needs in a privileged LXC. The Proxmox API can't set
+# these, so provision.yml writes them into /etc/pve/nodes/<node>/lxc/<vmid>.conf
+# over SSH on the node, before the first start.
+lxc_raw_config:
+  - "lxc.apparmor.profile: unconfined"
+  - "lxc.cgroup2.devices.allow: a"
+  - "lxc.cap.drop: "
+  - "lxc.mount.auto: proc:rw sys:rw"

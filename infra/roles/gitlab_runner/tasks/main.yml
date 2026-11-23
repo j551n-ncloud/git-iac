@@ -1,0 +1,127 @@
+---
+# Installs gitlab-runner and registers it once. Safe to re-run: the
+# package is only installed, registration is skipped when config.toml
+# already holds this token, and `concurrent` is only rewritten when it
+# differs. Upgrades of the package go through playbooks/patch.yml.
+
+- name: Required settings are present
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - gitlab_runner_url | length > 0
+      - gitlab_runner_token | length > 0
+      - gitlab_runner_token is match('^glrt-')
+    fail_msg: >-
+      {{ inventory_hostname }}: needs gitlab_runner_url and an
+      authentication token starting with glrt- (vault_gitlab_runner_token,
+      see inventory/group_vars/ci_runner/vault_gitlab_runner.yml.example).
+      A legacy registration token does not work here.
+
+- name: Keyrings directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+# Only fetched when missing, like roles/docker.
+- name: Is GitLab's apt key there
+  ansible.builtin.stat:
+    path: /etc/apt/keyrings/gitlab-runner.asc
+  register: gitlab_runner_key
+
+- name: GitLab's apt key
+  ansible.builtin.get_url:
+    url: "{{ gitlab_runner_apt_key_url }}"
+    dest: /etc/apt/keyrings/gitlab-runner.asc
+    mode: "0644"
+  when: not gitlab_runner_key.stat.exists
+
+- name: GitLab's apt source
+  ansible.builtin.copy:
+    dest: /etc/apt/sources.list.d/gitlab-runner.list
+    content: "deb [signed-by=/etc/apt/keyrings/gitlab-runner.asc] {{ gitlab_runner_apt_repo_url }} {{ gitlab_runner_apt_suite }} main\n"
+    mode: "0644"
+  register: gitlab_runner_source
+
+# Debian ships an older gitlab-runner of its own. Without this pin apt
+# may prefer it; GitLab's own install script writes the same pin.
+- name: Prefer GitLab's package over Debian's
+  ansible.builtin.copy:
+    dest: /etc/apt/preferences.d/pin-gitlab-runner.pref
+    content: |
+      Package: gitlab-runner
+      Pin: origin packages.gitlab.com
+      Pin-Priority: 1001
+    mode: "0644"
+
+- name: Install gitlab-runner
+  ansible.builtin.apt:
+    name: gitlab-runner
+    state: present
+    update_cache: "{{ gitlab_runner_source.changed }}"
+
+# The service runs as the gitlab-runner user, which needs the Docker
+# socket for the docker executor. Note: docker group membership is
+# root-equivalent on this host, which is why the runner gets its own LXC.
+- name: gitlab-runner may use Docker
+  ansible.builtin.user:
+    name: gitlab-runner
+    groups: docker
+    append: true
+  notify: Restart gitlab-runner
+
+# config.toml is root-only and holds the token: no_log, no diff.
+- name: Read config.toml, if it exists
+  ansible.builtin.slurp:
+    src: "{{ gitlab_runner_config }}"
+  register: gitlab_runner_conf
+  failed_when: false
+  check_mode: false
+  no_log: true
+
+- name: Is this runner already registered
+  ansible.builtin.set_fact:
+    gitlab_runner_registered: >-
+      {{ gitlab_runner_conf.content is defined
+         and gitlab_runner_token in (gitlab_runner_conf.content | b64decode) }}
+  no_log: true
+
+# The token goes in through the environment, not the command line, so it
+# does not show up in `ps`. Docker image, pull policy and privileged
+# mode are executor settings, which register does accept.
+- name: Register the runner
+  ansible.builtin.command:
+    argv:
+      - gitlab-runner
+      - register
+      - --non-interactive
+      - --name
+      - "{{ gitlab_runner_name }}"
+      - --executor
+      - docker
+      - --docker-image
+      - "{{ gitlab_runner_docker_image }}"
+      - --docker-pull-policy
+      - "{{ gitlab_runner_docker_pull_policy }}"
+      - "--docker-privileged={{ gitlab_runner_docker_privileged | bool | lower }}"
+  environment:
+    CI_SERVER_URL: "{{ gitlab_runner_url }}"
+    CI_SERVER_TOKEN: "{{ gitlab_runner_token }}"
+  when: not gitlab_runner_registered | bool
+  no_log: true
+  notify: Restart gitlab-runner
+
+- name: Concurrency
+  ansible.builtin.lineinfile:
+    path: "{{ gitlab_runner_config }}"
+    regexp: '^concurrent\s*='
+    line: "concurrent = {{ gitlab_runner_concurrent }}"
+    insertbefore: BOF   # must stay a top-level key if it has to be added
+  when: not ansible_check_mode or gitlab_runner_registered | bool
+  notify: Restart gitlab-runner
+
+- name: gitlab-runner running and enabled
+  ansible.builtin.systemd_service:
+    name: gitlab-runner
+    state: started
+    enabled: true

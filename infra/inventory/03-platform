@@ -1,0 +1,23 @@
+# ======================================================
+#  Platform: CI runner and k3s.
+# ======================================================
+
+# DEFAULT CI path: one Debian LXC with Docker and the gitlab-runner
+# package (roles/gitlab_runner, playbooks/runner.yml). Keep it OFF the
+# hosts the deploy repo deploys to: recreating a stack on the runner's
+# own host can kill the job that is doing it.
+[ci_runner]
+runner1        ansible_host=192.168.1.41    proxmox_node=pve1  proxmox_vmid=140  # Debian 13
+
+# OPTIONAL, heavier CI path: three privileged LXCs forming a k3s cluster
+# (embedded etcd) that runs the gitlab-runner Helm chart. Only needed if
+# you want Kubernetes anyway. Sizes: group_vars/platform_k3s/lxc.yml.
+# Leave these commented out if you only use runner1.
+[platform_k3s]
+# k3s1         ansible_host=192.168.1.51    proxmox_node=pve1  proxmox_vmid=150
+# k3s2         ansible_host=192.168.1.52    proxmox_node=pve2  proxmox_vmid=151  lxc_memory=8192
+# k3s3         ansible_host=192.168.1.53    proxmox_node=pve3  proxmox_vmid=152  lxc_memory=8192
+
+[platform:children]
+ci_runner
+platform_k3s

@@ -1,0 +1,16 @@
+// Managed by Ansible (roles/base in infra). Local changes are overwritten.
+// Read after 50unattended-upgrades, so these lists replace the package defaults.
+
+Unattended-Upgrade::Origins-Pattern {
+        "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
+};
+
+Unattended-Upgrade::Package-Blacklist {
+{% for p in unattended_upgrades_blacklist %}
+        "{{ p }}";
+{% endfor %}
+};
+
+Unattended-Upgrade::Automatic-Reboot "{{ 'true' if unattended_upgrades_reboot else 'false' }}";
+Unattended-Upgrade::Remove-Unused-Dependencies "false";
+Unattended-Upgrade::SyslogEnable "true";

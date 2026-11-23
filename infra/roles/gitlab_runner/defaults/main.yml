@@ -1,0 +1,37 @@
+---
+# gitlab-runner from GitLab's official apt repo, docker executor,
+# registered non-interactively with an AUTHENTICATION token (glrt-...).
+# Docker itself comes from roles/docker (the runner host is in
+# docker_hosts via ci_runner).
+
+# Required. Set in group_vars/ci_runner/vars.yml.
+gitlab_runner_url: ""
+# Required: the glrt-... token, from vault (vault_gitlab_runner_token).
+# Create the runner in the GitLab UI first; tags, "run untagged jobs"
+# and the lock state are set THERE, because gitlab-runner register
+# refuses them together with an authentication token.
+gitlab_runner_token: ""
+
+# Name shown in the GitLab UI and written to config.toml.
+gitlab_runner_name: "{{ inventory_hostname }}"
+
+# Jobs that run at once (top-level `concurrent` in config.toml). Every
+# job is a container on this one host: size the LXC for it.
+gitlab_runner_concurrent: 2
+
+# Docker executor.
+gitlab_runner_docker_image: alpine:latest
+# Jobs that build images (docker-in-docker) need a privileged executor,
+# which lets any job on this runner take over the host. Only turn this
+# on for a runner that runs your own, protected projects.
+gitlab_runner_docker_privileged: false
+gitlab_runner_docker_pull_policy: if-not-present
+
+# apt repo. The suite defaults to the host's release (trixie on Debian
+# 13). If GitLab's repo has no suite for your release yet, set it to the
+# newest one it has (e.g. bookworm); the package is the same binary.
+gitlab_runner_apt_suite: "{{ ansible_facts.distribution_release }}"
+gitlab_runner_apt_key_url: https://packages.gitlab.com/runner/gitlab-runner/gpgkey
+gitlab_runner_apt_repo_url: https://packages.gitlab.com/runner/gitlab-runner/debian/
+
+gitlab_runner_config: /etc/gitlab-runner/config.toml

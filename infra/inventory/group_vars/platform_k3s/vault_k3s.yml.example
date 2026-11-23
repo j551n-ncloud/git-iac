@@ -1,0 +1,12 @@
+---
+# Copy to vault_k3s.yml (gitignored). The cluster join token, written to
+# /etc/rancher/k3s/config.yaml on every server. Generate a long random
+# string, then encrypt it:
+#
+#   openssl rand -hex 32
+#   ansible-vault encrypt_string --vault-password-file .vault_pass.txt \
+#     --name vault_k3s_token '<the random string>'
+#
+# and paste the whole output below. Per-value !vault, same password as
+# the other vault files.
+vault_k3s_token: "REPLACE_ME"

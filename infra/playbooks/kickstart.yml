@@ -1,0 +1,78 @@
+---
+# Brings up a host that is already written into the inventory: creates its
+# LXC (provision), bootstraps it (root accepts the deploy key) and applies
+# base. Run through bin/kickstart <host>.
+#
+# On a host that already exists it only compares the LXC with the
+# inventory, then re-runs bootstrap and base as deploy (idempotent).
+
+- name: Create the LXC
+  hosts: all:!proxmox_nodes
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Exactly one host
+      ansible.builtin.assert:
+        quiet: true
+        that: ansible_play_hosts_all | length == 1
+        fail_msg: "kickstart takes one host (--limit <host>), got {{ ansible_play_hosts_all | length }}."
+      run_once: true
+
+    - name: Create or compare
+      ansible.builtin.include_role:
+        name: proxmox_lxc
+
+# A freshly created LXC only has root (with the deploy key); an existing
+# host is already bootstrapped, so it is reached as deploy with sudo.
+- name: Bootstrap
+  hosts: all:!proxmox_nodes
+  gather_facts: false
+  vars:
+    lxc_new: "{{ (lxc_existing | default({})) == {} }}"
+    ansible_user: "{{ 'root' if lxc_new else 'deploy' }}"
+    ansible_become: "{{ not lxc_new }}"
+  tasks:
+    - name: Nothing to bootstrap in a dry run of a new LXC
+      ansible.builtin.meta: end_play
+      when: ansible_check_mode and (lxc_existing | default({})) == {}
+
+    - name: Python first
+      ansible.builtin.import_tasks: ../roles/host_bootstrap/tasks/python.yml
+
+    - name: Deploy user, key, stacks root, sudo
+      ansible.builtin.include_role:
+        name: host_bootstrap
+
+- name: Base packages and updates
+  hosts: all:!proxmox_nodes
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Nothing to apply in a dry run of a new LXC
+      ansible.builtin.meta: end_play
+      when: ansible_check_mode and (lxc_existing | default({})) == {}
+
+    - name: Gather facts
+      ansible.builtin.setup:
+
+    - name: Base
+      ansible.builtin.include_role:
+        name: base
+
+    - name: Tailscale settings
+      ansible.builtin.include_role:
+        name: tailscale
+      when: tailscale_accept_routes is defined
+
+    - name: Docker
+      ansible.builtin.include_role:
+        name: docker
+      when: "'docker_hosts' in group_names"
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} is up ({{ ansible_host }}). Commit the
+          inventory line. On an app host, stacks go into the deploy repo
+          (host_vars/{{ inventory_hostname }}.yml, and [services_apps] here).
+          On the runner, next: ansible-playbook playbooks/runner.yml.

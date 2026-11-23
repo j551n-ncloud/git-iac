@@ -1,0 +1,22 @@
+---
+# Passwordless sudo for the deploy user, where deploy_user_sudo is true:
+# every [base] host (group_vars/base.yml, base.yml and patch.yml need
+# root), plus hosts whose stacks run with become: true in the deploy
+# repo (set per host). A host can opt out with deploy_user_sudo: false.
+#
+# What it costs: passwordless sudo makes the deploy key (CI's
+# SSH_PRIVATE_KEY) root-equivalent on that host.
+
+- name: Install sudo (minimal LXC templates can ship without it)
+  ansible.builtin.package:
+    name: sudo
+    state: present
+  when: deploy_user_sudo | default(false) | bool
+
+- name: Grant the deploy user passwordless sudo
+  ansible.builtin.copy:
+    dest: /etc/sudoers.d/{{ deploy_user }}-deploy
+    content: "{{ deploy_user }} ALL=(root) NOPASSWD:ALL\n"
+    mode: "0440"
+    validate: "visudo -cf %s"
+  when: deploy_user_sudo | default(false) | bool

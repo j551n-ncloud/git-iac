@@ -1,0 +1,27 @@
+---
+# DEFAULT CI path: one LXC as GitLab runner. Installs Docker (idempotent,
+# already done by bin/kickstart on docker_hosts) and the gitlab-runner
+# package, registers the runner with the glrt- token from vault, and sets
+# the concurrency.
+#
+# Before the first run:
+#   1. GitLab UI: Settings > CI/CD > Runners > New project runner (or a
+#      group or instance runner). Set the tags there, copy the glrt-... token.
+#   2. inventory/group_vars/ci_runner/vault_gitlab_runner.yml with the token
+#      encrypted (see the .example next to it), gitlab_runner_url in vars.yml.
+#
+#   ansible-playbook playbooks/runner.yml --vault-password-file .vault_pass.txt --check
+#   ansible-playbook playbooks/runner.yml --vault-password-file .vault_pass.txt
+#
+# Re-running changes nothing once the runner is registered. To replace the
+# token (rotation), delete the runner section from
+# /etc/gitlab-runner/config.toml (or `gitlab-runner unregister`), update
+# the vault value and run it again.
+
+- name: GitLab runner
+  hosts: ci_runner
+  become: true
+  gather_facts: true
+  roles:
+    - docker
+    - gitlab_runner

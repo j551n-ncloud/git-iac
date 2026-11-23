@@ -1,0 +1,4 @@
+---
+# Set per host to manage Tailscale's accept-routes pref; undefined means
+# the role does nothing on that host.
+# tailscale_accept_routes: false

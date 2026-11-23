@@ -1,0 +1,12 @@
+# Proxmox API credentials, written by you from scripts/proxmox-api-token.sh
+.proxmox.json
+.vault_pass.txt
+# Real secrets. Only the .example files are committed.
+inventory/group_vars/*/vault_*.yml
+!inventory/group_vars/*/*.example
+# Written by playbooks/updates_report.yml
+host_updates.json
+*.retry
+__pycache__/
+.venv/
+.ansible/

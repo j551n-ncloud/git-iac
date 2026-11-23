@@ -1,0 +1,26 @@
+---
+# Creates the LXCs the inventory describes but Proxmox does not have yet.
+# Existing containers are only compared and reported, never changed.
+#
+# Usually run through bin/kickstart <host> (playbooks/kickstart.yml), which
+# runs this, bootstrap and base. By hand, a new LXC:
+#   1. a line in inventory/0x-*, in its functional group:
+#        name  ansible_host=192.168.1.x  proxmox_node=pve2  proxmox_vmid=nnn  [lxc_cores=4 lxc_memory=8192 lxc_disk_gb=40]
+#      (defaults in group_vars/all.yml: Debian 13, local-lvm, nesting)
+#   2. ansible-playbook playbooks/provision.yml -e @.proxmox.json --limit name --check   # shows what it would create
+#      ansible-playbook playbooks/provision.yml -e @.proxmox.json --limit name
+#   3. ansible-playbook playbooks/bootstrap.yml --limit name -e ansible_user=root -e ansible_become=false
+#   4. ansible-playbook playbooks/base.yml --limit name
+#
+# Root gets the deploy key, so bootstrap needs no password. Needs a
+# Proxmox token that may create guests (VM.Allocate, Datastore.AllocateSpace,
+# SDN.Use on the bridge); scripts/proxmox-api-token.sh creates one.
+
+- name: Provision LXCs
+  hosts: all:!proxmox_nodes
+  gather_facts: false
+  connection: local
+  tasks:
+    - name: Create or compare this host's LXC
+      ansible.builtin.include_role:
+        name: proxmox_lxc

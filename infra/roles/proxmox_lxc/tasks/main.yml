@@ -1,0 +1,215 @@
+---
+# Creates this host's LXC through the Proxmox API if its vmid does not
+# exist yet. Never modifies or deletes an existing container: for one
+# that exists it reports where it differs from the inventory.
+#
+# Runs on the controller (delegate_to: localhost), like proxmox_snapshot,
+# with plain uri calls instead of an SDK-backed module. no_log on every
+# call carrying the token.
+
+- name: "{{ inventory_hostname }} | Inventory and API settings are complete"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - proxmox_api_url | default('') | length > 0
+      - proxmox_api_token_id | default('') | length > 0
+      - proxmox_api_token_secret | default('') | length > 0
+      - proxmox_node is defined
+      - proxmox_vmid is defined
+      - ansible_host is match('^\d+\.\d+\.\d+\.\d+$')
+      - "'EXAMPLEKEY' not in deploy_public_key"
+    fail_msg: >-
+      {{ inventory_hostname }}: needs proxmox_node, proxmox_vmid and a
+      static ansible_host on its inventory line, and the Proxmox API
+      credentials (-e @.proxmox.json), and deploy_public_key in
+      inventory/group_vars/all.yml must be your real public key.
+
+- name: "{{ inventory_hostname }} | Look up the guest in the cluster"
+  ansible.builtin.uri:
+    url: "{{ proxmox_api_url }}/api2/json/cluster/resources?type=vm"
+    headers:
+      Authorization: "PVEAPIToken={{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
+    validate_certs: "{{ proxmox_api_validate_certs | default(false) }}"
+    timeout: 30
+  delegate_to: localhost
+  register: lxc_cluster
+  check_mode: false
+  no_log: true
+
+- name: "{{ inventory_hostname }} | Work out what exists"
+  ansible.builtin.set_fact:
+    lxc_existing: "{{ lxc_cluster.json.data | selectattr('vmid', 'equalto', proxmox_vmid | int) | first | default({}) }}"
+    lxc_hostname_taken_by: >-
+      {{ lxc_cluster.json.data | selectattr('name', 'defined') | selectattr('name', 'equalto', inventory_hostname)
+         | rejectattr('vmid', 'equalto', proxmox_vmid | int) | map(attribute='vmid') | list }}
+
+- name: "{{ inventory_hostname }} | vmid and name must not belong to something else"
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - lxc_existing == {} or lxc_existing.name | default('') == inventory_hostname
+      - lxc_existing == {} or lxc_existing.type == 'lxc'
+      - lxc_hostname_taken_by | length == 0
+    fail_msg: >-
+      {{ inventory_hostname }}: vmid {{ proxmox_vmid }} is
+      {{ lxc_existing.type | default('') }} "{{ lxc_existing.name | default('') }}"
+      on {{ lxc_existing.node | default('') }}, or the name is already used
+      by vmid {{ lxc_hostname_taken_by }}. Fix the inventory line.
+
+# ---- existing container: report, never change ------------------------
+
+- name: "{{ inventory_hostname }} | Read the existing config"
+  ansible.builtin.uri:
+    url: "{{ proxmox_api_url }}/api2/json/nodes/{{ lxc_existing.node }}/lxc/{{ proxmox_vmid }}/config"
+    headers:
+      Authorization: "PVEAPIToken={{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
+    validate_certs: "{{ proxmox_api_validate_certs | default(false) }}"
+    timeout: 30
+  delegate_to: localhost
+  register: lxc_config
+  check_mode: false
+  no_log: true
+  when: lxc_existing != {}
+
+- name: "{{ inventory_hostname }} | Read the raw config on the node"
+  ansible.builtin.slurp:
+    src: /etc/pve/nodes/{{ lxc_existing.node }}/lxc/{{ proxmox_vmid }}.conf
+  delegate_to: "{{ lxc_existing.node }}"
+  connection: ssh   # the play runs with connection: local
+  register: lxc_conf_file
+  check_mode: false
+  when: lxc_existing != {} and lxc_raw_config | default([]) | length > 0
+
+- name: "{{ inventory_hostname }} | Report differences from the inventory"
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} exists (vmid {{ proxmox_vmid }} on {{ lxc_existing.node }}, {{ lxc_existing.status }}).
+      {{ ('Differs from inventory: ' ~ (drift | join(', ')) ~ '. Not changed.') if drift else 'Matches the inventory.' }}
+  vars:
+    cfg: "{{ lxc_config.json.data }}"
+    ip_in_cfg: "{{ cfg.net0 | default('') | regex_search('ip=([0-9./]+)', '\\1') | default([''], true) | first }}"
+    raw_lines: "{{ (lxc_conf_file.content | b64decode).split('\n[')[0].splitlines() | map('trim') | list if lxc_conf_file.content is defined else [] }}"
+    missing_raw: "{{ lxc_raw_config | default([]) | map('trim') | reject('in', raw_lines) | list }}"
+    disk_gb: "{{ cfg.rootfs | regex_search('size=(\\d+)G', '\\1') | default(['0'], true) | first }}"
+    drift: >-
+      {{ ([] if lxc_existing.node == proxmox_node else ['node ' ~ lxc_existing.node ~ ' (inventory ' ~ proxmox_node ~ ')'])
+         + ([] if cfg.cores | default(1) | int == lxc_cores | int else ['cores ' ~ cfg.cores | default(1) ~ ' (inventory ' ~ lxc_cores ~ ')'])
+         + ([] if cfg.memory | int == lxc_memory | int else ['memory ' ~ cfg.memory ~ ' (inventory ' ~ lxc_memory ~ ')'])
+         + ([] if cfg.swap | default(512) | int == lxc_swap | int else ['swap ' ~ cfg.swap | default(512) ~ ' (inventory ' ~ lxc_swap ~ ')'])
+         + ([] if disk_gb | int == lxc_disk_gb | int else ['disk ' ~ disk_gb ~ 'G (inventory ' ~ lxc_disk_gb ~ 'G)'])
+         + ([] if (cfg.unprivileged | default(0) | int == 1) == (lxc_unprivileged | bool) else ['unprivileged ' ~ cfg.unprivileged | default(0) ~ ' (inventory ' ~ lxc_unprivileged ~ ')'])
+         + (['missing raw lines: ' ~ (missing_raw | join(' / '))] if missing_raw else [])
+         + ([] if ip_in_cfg in ['dhcp', ansible_host ~ '/' ~ lxc_prefix] or 'ip=dhcp' in cfg.net0 | default('') else ['ip ' ~ ip_in_cfg ~ ' (inventory ' ~ ansible_host ~ ')']) }}
+  when: lxc_existing != {}
+
+# ---- missing container: create ---------------------------------------
+
+- name: "{{ inventory_hostname }} | Create the LXC"
+  when: lxc_existing == {}
+  block:
+    - name: "{{ inventory_hostname }} | The address must be free"
+      ansible.builtin.command: ping -c 1 -W 1 {{ ansible_host }}
+      delegate_to: localhost
+      register: lxc_ping
+      changed_when: false
+      failed_when: lxc_ping.rc == 0
+      check_mode: false
+
+    - name: "{{ inventory_hostname }} | What will be created"
+      ansible.builtin.debug:
+        msg: "{{ lxc_create_body | dict2items | rejectattr('key', 'equalto', 'ssh-public-keys') | items2dict }}"
+
+    - name: "{{ inventory_hostname }} | Create vmid {{ proxmox_vmid }} on {{ proxmox_node }}"
+      ansible.builtin.uri:
+        url: "{{ proxmox_api_url }}/api2/json/nodes/{{ proxmox_node }}/lxc"
+        method: POST
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
+        body_format: form-urlencoded
+        body: "{{ lxc_create_body }}"
+        validate_certs: "{{ proxmox_api_validate_certs | default(false) }}"
+        timeout: 60
+      delegate_to: localhost
+      register: lxc_create
+      no_log: true
+
+    - name: "{{ inventory_hostname }} | Wait for the create task"
+      ansible.builtin.uri:
+        url: "{{ proxmox_api_url }}/api2/json/nodes/{{ proxmox_node }}/tasks/{{ lxc_create.json.data | urlencode }}/status"
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_api_validate_certs | default(false) }}"
+        timeout: 30
+      delegate_to: localhost
+      register: lxc_task
+      until: lxc_task.json.data.status == "stopped"
+      retries: 60
+      delay: 5
+      no_log: true
+      when: not ansible_check_mode
+
+    - name: "{{ inventory_hostname }} | The create task must have succeeded"
+      ansible.builtin.assert:
+        quiet: true
+        that: lxc_task.json.data.exitstatus == "OK"
+        fail_msg: "{{ inventory_hostname }}: Proxmox reported {{ lxc_task.json.data.exitstatus | default('unknown') }}."
+      when: not ansible_check_mode
+
+    # Before the first start: the API can't set lxc.* keys. pmxcfs is shared,
+    # so the file is written on the guest's own node.
+    - name: "{{ inventory_hostname }} | Raw lxc.* lines"
+      ansible.builtin.lineinfile:
+        path: /etc/pve/nodes/{{ proxmox_node }}/lxc/{{ proxmox_vmid }}.conf
+        regexp: "^{{ item.split(':')[0] | regex_escape }}:"
+        line: "{{ item }}"
+      loop: "{{ lxc_raw_config | default([]) }}"
+      delegate_to: "{{ proxmox_node }}"
+      connection: ssh   # the play runs with connection: local
+      when: not ansible_check_mode
+
+    - name: "{{ inventory_hostname }} | Start it"
+      ansible.builtin.uri:
+        url: "{{ proxmox_api_url }}/api2/json/nodes/{{ proxmox_node }}/lxc/{{ proxmox_vmid }}/status/start"
+        method: POST
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_api_validate_certs | default(false) }}"
+        timeout: 60
+      delegate_to: localhost
+      no_log: true
+      when: not ansible_check_mode and lxc_raw_config | default([]) | length > 0
+
+    - name: "{{ inventory_hostname }} | Wait for SSH"
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        timeout: 180
+      delegate_to: localhost
+      when: not ansible_check_mode
+
+    - name: "{{ inventory_hostname }} | Created"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} is up at {{ ansible_host }}. Next:
+          ansible-playbook playbooks/bootstrap.yml --limit {{ inventory_hostname }} -e ansible_user=root -e ansible_become=false
+          (root accepts the deploy key), then base.yml.
+      when: not ansible_check_mode
+  vars:
+    lxc_create_body:
+      vmid: "{{ proxmox_vmid }}"
+      hostname: "{{ inventory_hostname }}"
+      ostemplate: "{{ lxc_template }}"
+      cores: "{{ lxc_cores }}"
+      memory: "{{ lxc_memory }}"
+      swap: "{{ lxc_swap }}"
+      rootfs: "{{ lxc_storage }}:{{ lxc_disk_gb }}"
+      net0: >-
+        name=eth0,bridge={{ lxc_bridge }},ip={{ ansible_host }}/{{ lxc_prefix }},gw={{ lxc_gateway }}{{ ',firewall=1' if lxc_firewall | bool else '' }}
+      nameserver: "{{ lxc_nameserver }}"
+      features: "{{ lxc_features }}"
+      unprivileged: "{{ 1 if lxc_unprivileged | bool else 0 }}"
+      onboot: "{{ 1 if lxc_onboot | bool else 0 }}"
+      start: "{{ 0 if lxc_raw_config | default([]) | length > 0 else 1 }}"
+      # Proxmox tags from the host's functional groups (edge_vpn, services_apps, ci_runner, ...)
+      tags: "{{ group_names | select('match', '^(edge|services|platform|ci)_') | join(';') }}"
+      ssh-public-keys: "{{ deploy_public_key }}"

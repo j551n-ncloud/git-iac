@@ -1,0 +1,8 @@
+---
+ansible_user: root
+# Kernel modules and sysctls k3s needs inside privileged LXCs (they share
+# the host kernel).
+proxmox_host_modules: [overlay, br_netfilter]
+proxmox_host_sysctl:
+  net.bridge.bridge-nf-call-iptables: 1
+  net.ipv4.ip_forward: 1

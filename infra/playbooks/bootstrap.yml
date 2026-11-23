@@ -1,0 +1,40 @@
+---
+# One-time host setup, run by hand from an admin workstation (not from
+# CI) before Ansible can manage a host: creates the deploy user, installs
+# its key, the stacks root and (where deploy_user_sudo is set) sudo.
+# Idempotent.
+#
+# A NEW host, as root with its password:
+#
+#   ansible-playbook playbooks/bootstrap.yml --limit <host> \
+#     -e ansible_user=root -e ansible_become=false --ask-pass
+#
+# (A host made by bin/kickstart already accepts root with the deploy key,
+# so there --ask-pass is not needed.) `-e ansible_user=root` only changes the connection user; the account
+# being created comes from deploy_user, so the two can't be confused.
+#
+# Re-running on a bootstrapped host works as deploy wherever it has sudo
+# (every host that did not opt out with deploy_user_sudo: false):
+#
+#   ansible-playbook playbooks/bootstrap.yml --limit <host>
+#
+# What it does, in order (see roles/host_bootstrap/tasks/*.yml):
+#   python.yml       install Python, via raw, before anything needs it
+#   user.yml         the deploy account + docker group membership
+#   ssh_key.yml      the deploy key, at whatever path sshd really reads
+#   directories.yml  deploy_root (stack directories are services/deploy's job)
+#   sudo.yml         passwordless sudo where deploy_user_sudo is true
+
+- name: Ensure Python is present (every other module needs it; raw doesn't)
+  hosts: all
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Bootstrap a Python interpreter
+      ansible.builtin.import_tasks: ../roles/host_bootstrap/tasks/python.yml
+
+- name: Bootstrap a deploy target
+  hosts: all
+  become: true
+  roles:
+    - host_bootstrap

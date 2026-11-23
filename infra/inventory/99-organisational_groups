@@ -1,0 +1,31 @@
+# ======================================================
+#  Organisational groups: ONLY groups built from other
+#  groups. No hosts and no host settings in here.
+# ======================================================
+
+# What the deploy repo deploys to. Its preflight asserts this matches
+# the hosts that define stacks there.
+[managed:children]
+services_apps
+
+# Debian hosts whose packages and updates this repo manages (base.yml,
+# patch.yml, updates_report.yml need sudo, see group_vars/base.yml).
+# The k3s nodes are not here: they are managed as root by k3s.yml.
+[base:children]
+edge
+services_apps
+ci_runner
+
+# Hosts that run Docker (roles/docker via base.yml and bin/kickstart).
+[docker_hosts:children]
+services_apps
+ci_runner
+
+[production:children]
+edge
+services
+platform
+
+[env:children]
+staging
+production

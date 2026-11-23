@@ -1,0 +1,7 @@
+---
+# Host prep on the Proxmox nodes (kernel modules and sysctls for k3s LXCs).
+#   ansible-playbook playbooks/proxmox.yml --check --diff
+- name: Proxmox nodes
+  hosts: proxmox_nodes
+  roles:
+    - proxmox_host

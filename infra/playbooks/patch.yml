@@ -1,0 +1,122 @@
+---
+# Full apt upgrade of the [base] hosts, one host at a time:
+#
+#   1. Proxmox snapshot of the LXC (prefix "patch", newest 2 kept)
+#   2. apt full-upgrade; packages in apt_holds stay where they are
+#   3. reboot, only if the host asks for one (/var/run/reboot-required)
+#   4. wait until every container that ran before runs again, and every
+#      unit in the host's patch_services (host_vars) is active
+#
+# Stops at the first host that fails, so a bad upgrade hits one host.
+# Security updates already arrive daily through unattended-upgrades
+# (roles/base); this is for everything else, Docker included.
+#
+# Run locally, never from CI: patching the host that runs your GitLab (or
+# the runner itself) would restart what runs the job.
+#
+#   ansible-playbook playbooks/patch.yml -e @.proxmox.json
+#   ansible-playbook playbooks/patch.yml ... --limit app1            # one host
+#   ansible-playbook playbooks/patch.yml ... -e patch_reboot=false   # never reboot
+#
+# Rollback: Proxmox UI > the LXC > Snapshots > patch-<timestamp>.
+
+- name: Patch Debian hosts
+  hosts: base
+  serial: 1
+  max_fail_percentage: 0
+  become: true
+  gather_facts: true
+  vars:
+    patch_snapshot: true
+    patch_reboot: true
+    patch_container_wait_retries: 30   # x 10s
+  tasks:
+    # apt only.
+    - name: Skip hosts that are not Debian
+      when: ansible_facts.os_family != 'Debian'
+      block:
+        - name: Report the skip
+          ansible.builtin.debug:
+            msg: "{{ inventory_hostname }} runs {{ ansible_facts.distribution }}, skipped (apt only)."
+
+        - name: Stop here for this host
+          ansible.builtin.meta: end_host
+
+    - name: Snapshot the LXC first
+      ansible.builtin.include_role:
+        name: proxmox_snapshot
+        # Its API calls are delegated to localhost; without this they
+        # would inherit the play's become and try sudo on the controller.
+        apply:
+          become: false
+      vars:
+        proxmox_snapshot_prefix: patch
+        proxmox_snapshot_keep: 2
+        proxmox_snapshot_reason: "Pre-patch snapshot taken by playbooks/patch.yml."
+      when: patch_snapshot | bool and not ansible_check_mode   # a dry run takes no snapshot
+
+    - name: Record the containers running before the upgrade
+      ansible.builtin.command: docker ps --format '{{ "{{" }}.Names{{ "}}" }}'
+      register: containers_before
+      changed_when: false
+      failed_when: false
+
+    - name: Refresh the package lists
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: List what will be upgraded
+      ansible.builtin.command: apt list --upgradable
+      register: upgradable
+      changed_when: false
+
+    - name: Show what will be upgraded
+      ansible.builtin.debug:
+        msg: "{{ upgradable.stdout_lines | reject('match', '^Listing') | list }}"
+
+    - name: apt full-upgrade
+      ansible.builtin.apt:
+        upgrade: dist
+        autoremove: false
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      register: upgrade_result
+
+    - name: Check whether a reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Reboot
+      ansible.builtin.reboot:
+        reboot_timeout: 600
+      when:
+        - patch_reboot | bool
+        - reboot_required.stat.exists
+
+    - name: Wait until every container from before runs again
+      ansible.builtin.command: docker ps --format '{{ "{{" }}.Names{{ "}}" }}'
+      register: containers_after
+      changed_when: false
+      until: containers_before.stdout_lines | difference(containers_after.stdout_lines) | length == 0
+      retries: "{{ patch_container_wait_retries }}"
+      delay: 10
+      when: containers_before.rc == 0 and containers_before.stdout_lines | length > 0
+
+    - name: Wait until the host's own services are active again
+      ansible.builtin.command: systemctl is-active {{ item }}
+      register: service_state
+      changed_when: false
+      until: service_state.stdout == 'active'
+      retries: "{{ patch_container_wait_retries }}"
+      delay: 10
+      loop: "{{ patch_services | default([]) }}"
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ (upgradable.stdout_lines | reject('match', '^Listing') | list | length) }} package(s) upgraded,
+          {{ 'rebooted' if (patch_reboot | bool and reboot_required.stat.exists)
+             else ('REBOOT PENDING' if reboot_required.stat.exists else 'no reboot needed') }},
+          {{ containers_before.stdout_lines | default([]) | length }} container(s) back up.

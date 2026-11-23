@@ -1,0 +1,27 @@
+---
+# OPTIONAL path: k3s on the platform_k3s nodes, one at a time so etcd keeps
+# quorum (2 of 3). The first node in the group starts the cluster, the
+# others join through it. Installs the pinned version, writes config.yaml (and registries.yaml
+# if k3s_registry_mirrors is set), restarts k3s only when one changed, and waits until the node is
+# Ready before touching the next one.
+#
+#   ansible-playbook playbooks/k3s.yml --vault-password-file .vault_pass.txt --check
+#   ansible-playbook playbooks/k3s.yml --vault-password-file .vault_pass.txt [--limit k3s2]
+#
+# Upgrade: change k3s_version in roles/k3s/defaults, run it. A new node:
+# its line in inventory/03-platform [platform_k3s], then
+#   bin/kickstart <node>       (privileged LXC + raw lxc.* lines, bootstrap, base)
+#   ansible-playbook playbooks/k3s.yml --limit <node>
+# playbooks/proxmox.yml prepares the hypervisor kernel once per node.
+#
+# Runs as root: k3s needs it, and root accepts the deploy key (the key
+# Proxmox put there when the LXC was created).
+
+- name: k3s servers
+  hosts: platform_k3s
+  serial: 1
+  max_fail_percentage: 0
+  vars:
+    ansible_user: root
+  roles:
+    - k3s
