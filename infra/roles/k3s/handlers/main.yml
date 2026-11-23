@@ -1,0 +1,15 @@
+---
+- name: Restart k3s
+  ansible.builtin.systemd_service:
+    name: k3s
+    state: restarted
+  notify: Wait for the node to be Ready
+
+- name: Wait for the node to be Ready
+  ansible.builtin.command: k3s kubectl get node {{ inventory_hostname }} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+  register: k3s_ready
+  until: k3s_ready.stdout == 'True'
+  retries: 36
+  delay: 5
+  changed_when: false
+  when: not ansible_check_mode   # nothing was restarted in a dry run

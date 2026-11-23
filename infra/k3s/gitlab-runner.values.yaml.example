@@ -1,0 +1,81 @@
+# OPTIONAL, heavier CI path: the gitlab-runner Helm chart on the k3s
+# cluster from playbooks/k3s.yml, Kubernetes executor (every job is a pod).
+# If one runner LXC (roles/gitlab_runner) is enough for you, skip this.
+#
+# 1. Create the runner in the GitLab UI (Settings > CI/CD > Runners > New
+#    project runner). Tags and "run untagged jobs" are set THERE.
+# 2. Put the glrt-... token into a Secret. The chart reads two keys; the
+#    registration-token key stays empty with an authentication token:
+#
+#      kubectl create namespace gitlab-runner
+#      kubectl -n gitlab-runner create secret generic runner-docker \
+#        --from-literal=runner-token='glrt-REPLACE_ME' \
+#        --from-literal=runner-registration-token=''
+#
+# 3. Copy this file to gitlab-runner.values.yaml (gitignore it if it holds
+#    anything private), set gitlabUrl, then:
+#
+#      helm repo add gitlab https://charts.gitlab.io
+#      helm upgrade --install gitlab-runner gitlab/gitlab-runner \
+#        --namespace gitlab-runner -f gitlab-runner.values.yaml
+#
+# On a k3s server, kubectl is `k3s kubectl` and the kubeconfig is
+# /etc/rancher/k3s/k3s.yaml (root only). To use it from your workstation,
+# copy it and replace 127.0.0.1 with a server's address.
+#
+# Not verified against a live cluster by the author of this sample:
+# check the chart's values against your chart version
+# (`helm show values gitlab/gitlab-runner`).
+
+gitlabUrl: https://gitlab.example.com
+
+# Jobs running at once across the whole cluster, and how often (seconds)
+# the runner polls GitLab for new ones.
+concurrent: 4
+checkInterval: 3
+
+rbac:
+  create: true
+
+runners:
+  # The Secret from step 2.
+  secret: runner-docker
+  name: k3s-runner
+  # Appended to the chart's generated config.toml. The chart sets the
+  # executor to kubernetes.
+  config: |
+    [[runners]]
+      [runners.kubernetes]
+        namespace = "gitlab-runner"
+        image = "alpine:latest"
+        # true lets a job take over the node. Only for runners that run
+        # your own protected projects (docker-in-docker builds).
+        privileged = false
+        pull_policy = ["always"]
+        allowed_pull_policies = ["always", "if-not-present"]
+        cpu_request = "250m"
+        memory_request = "256Mi"
+        service_cpu_request = "250m"
+        service_memory_request = "512Mi"
+        helper_cpu_request = "50m"
+        helper_memory_request = "64Mi"
+        # If your registry's name does not resolve on the nodes (a router
+        # that drops answers pointing at private addresses is the classic
+        # case), pin it for job pods:
+        # [[runners.kubernetes.host_aliases]]
+        #   ip = "192.168.1.4"
+        #   hostnames = ["registry.example.com"]
+        [[runners.kubernetes.volumes.empty_dir]]
+          name = "cache"
+          mount_path = "/cache"
+        # spread job pods over the nodes
+        [runners.kubernetes.affinity]
+          [runners.kubernetes.affinity.pod_anti_affinity]
+            [[runners.kubernetes.affinity.pod_anti_affinity.preferred_during_scheduling_ignored_during_execution]]
+              weight = 100
+              [runners.kubernetes.affinity.pod_anti_affinity.preferred_during_scheduling_ignored_during_execution.pod_affinity_term]
+                topology_key = "kubernetes.io/hostname"
+                [runners.kubernetes.affinity.pod_anti_affinity.preferred_during_scheduling_ignored_during_execution.pod_affinity_term.label_selector]
+                  [[runners.kubernetes.affinity.pod_anti_affinity.preferred_during_scheduling_ignored_during_execution.pod_affinity_term.label_selector.match_expressions]]
+                    key = "job.runner.gitlab.com/pod"
+                    operator = "Exists"

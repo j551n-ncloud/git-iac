@@ -1,0 +1,10 @@
+token: "{{ vault_k3s_token }}"
+disable: [{{ k3s_disable | join(', ') }}]
+write-kubeconfig-mode: "0600"
+{% if inventory_hostname == k3s_init_node %}
+cluster-init: true
+{% else %}
+server: {{ k3s_server_url }}
+{% endif %}
+node-ip: {{ ansible_host }}
+tls-san: [{{ k3s_tls_san | join(', ') }}]

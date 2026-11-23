@@ -1,0 +1,3 @@
+# Managed by Ansible (roles/k3s in infra). Local changes are overwritten.
+mirrors:
+{{ k3s_registry_mirrors | to_nice_yaml(indent=2) | indent(2, first=true) }}
