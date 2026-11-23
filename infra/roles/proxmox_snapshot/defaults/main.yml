@@ -1,0 +1,30 @@
+---
+# Proxmox API coordinates. Empty by default and asserted at run time, so
+# a half-configured snapshot fails loudly instead of quietly not
+# happening. Local runs get them from .proxmox.json (-e @.proxmox.json),
+# CI from masked CI/CD variables.
+proxmox_api_url: ""
+proxmox_api_token_id: ""
+proxmox_api_token_secret: ""
+
+# Proxmox ships a self-signed certificate by default. Flip to true once
+# the API has a certificate the runner trusts.
+proxmox_api_validate_certs: false
+
+# Every snapshot this role creates is named "<prefix>-<UTC timestamp>",
+# and ONLY snapshots carrying this prefix are ever considered for
+# pruning. A snapshot you took by hand is never touched.
+proxmox_snapshot_prefix: "ci"
+
+# First line of the snapshot description in the Proxmox UI.
+proxmox_snapshot_reason: "Snapshot taken by an infra playbook."
+
+# How many prefixed snapshots to keep per host, oldest pruned first.
+# Snapshots are not free: on thin-provisioned storage each one pins the
+# blocks its parent has since overwritten, so an unbounded series is a
+# slow disk-full outage.
+proxmox_snapshot_keep: 3
+
+# How long to wait for Proxmox to finish the snapshot task. Retried
+# every 5s, so 60 retries is 5 minutes.
+proxmox_snapshot_retries: 60

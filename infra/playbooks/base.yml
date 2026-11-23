@@ -1,0 +1,27 @@
+---
+# Baseline packages and unattended security updates on every host in
+# the [base] group (inventory/99-organisational_groups), plus Tailscale
+# settings on the VPN nodes and Docker CE on [docker_hosts]. See roles/base
+# for what it installs; it never removes anything.
+#
+# Run locally, first as a dry run:
+#
+#   ansible-playbook playbooks/base.yml --check --diff
+#   ansible-playbook playbooks/base.yml
+#
+# Needs root, through the deploy user's sudo. A host that opted out of
+# sudo (deploy_user_sudo: false in its host_vars) has to be run as root:
+#
+#   ansible-playbook playbooks/base.yml --limit <host> \
+#     -e ansible_user=root -e ansible_become=false --ask-pass
+
+- name: Baseline packages and unattended security updates
+  hosts: base
+  become: true
+  gather_facts: true
+  roles:
+    - base
+    - role: tailscale
+      when: tailscale_accept_routes is defined
+    - role: docker
+      when: "'docker_hosts' in group_names"

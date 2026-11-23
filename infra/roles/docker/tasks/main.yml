@@ -1,0 +1,80 @@
+---
+# Installs Docker CE where it is missing. Only installs (state: present):
+# Docker upgrades go through patch.yml, unattended-upgrades excludes them,
+# and apt_holds stay untouched.
+
+- name: Skip hosts that are not Debian
+  when: ansible_facts.os_family != 'Debian'
+  block:
+    - name: Report the skip
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} runs {{ ansible_facts.distribution }}, skipped (docker role is apt only)."
+
+    - name: Stop here for this host
+      ansible.builtin.meta: end_host
+
+- name: Check for Debian's docker.io
+  ansible.builtin.command: dpkg-query -W -f='${db:Status-Abbrev}' docker.io
+  register: docker_io_state
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Leave docker.io hosts alone unless asked
+  when:
+    - docker_io_state.stdout is match('^ii')
+    - not docker_replace_docker_io | bool
+  block:
+    - name: Report the skip
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} uses Debian's docker.io; skipped. Switching to
+          docker-ce restarts every container: -e docker_replace_docker_io=true
+          in a planned window.
+
+    - name: Stop here for this host
+      ansible.builtin.meta: end_host
+
+- name: Remove docker.io (docker_replace_docker_io)
+  ansible.builtin.apt:
+    name: [docker.io, docker-compose]
+    state: absent
+  when: docker_io_state.stdout is match('^ii')
+
+- name: Keyrings directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+# Only fetched when missing; an existing key file stays as it is.
+- name: Is Docker's apt key there
+  ansible.builtin.stat:
+    path: /etc/apt/keyrings/docker.asc
+  register: docker_key
+
+- name: Docker's apt key
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/debian/gpg
+    dest: /etc/apt/keyrings/docker.asc
+    mode: "0644"
+  when: not docker_key.stat.exists
+
+- name: Docker's apt source
+  ansible.builtin.copy:
+    dest: /etc/apt/sources.list.d/docker.list
+    content: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian {{ ansible_facts.distribution_release }} stable\n"
+    mode: "0644"
+  register: docker_source
+
+- name: Docker packages
+  ansible.builtin.apt:
+    name: "{{ docker_packages }}"
+    state: present
+    update_cache: "{{ docker_source.changed }}"
+
+- name: Docker running and enabled
+  ansible.builtin.systemd_service:
+    name: docker
+    state: started
+    enabled: true

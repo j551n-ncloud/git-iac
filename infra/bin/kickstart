@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Brings up a host from its inventory line:
+#
+#   bin/kickstart <host>             create the LXC, bootstrap, base
+#   bin/kickstart <host> --check     dry run: what would be created
+#   bin/kickstart --free             next free vmid, IPs and node for a new line
+#
+# Extra arguments go to ansible-playbook. Needs .proxmox.json in the repo
+# root (proxmox_api_url, proxmox_api_token_id, proxmox_api_token_secret).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+# Uses a virtualenv next to this repo if there is one (../deploy/.venv-ansible),
+# otherwise whatever ansible-playbook is on PATH.
+ap=ansible-playbook
+[ -x ../deploy/.venv-ansible/bin/ansible-playbook ] && ap=../deploy/.venv-ansible/bin/ansible-playbook
+[ -f .proxmox.json ] || { echo "missing .proxmox.json (Proxmox API credentials)" >&2; exit 1; }
+
+case "${1:-}" in
+  ""|-h|--help) sed -n '2,9p' "$0"; exit 0 ;;
+  --free) shift; exec "$ap" playbooks/free.yml -e @.proxmox.json "$@" ;;
+esac
+
+host=$1; shift
+inv=${ap%ansible-playbook}ansible-inventory
+"$inv" --host "$host" >/dev/null 2>&1 || {
+  echo "$host is not in the inventory. Add its line to inventory/0x-* first, e.g." >&2
+  echo "  $host  ansible_host=192.168.1.x  proxmox_node=pve2  proxmox_vmid=nnn" >&2
+  echo "(bin/kickstart --free suggests vmid, IP and node)" >&2
+  exit 1
+}
+exec "$ap" playbooks/kickstart.yml -e @.proxmox.json --limit "$host" "$@"

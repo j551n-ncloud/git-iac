@@ -1,0 +1,49 @@
+---
+# What every Debian host in the [base] group has installed. Only ever
+# adds packages: nothing here removes one, so a package missing from
+# this list is simply not managed, not uninstalled.
+#
+# Python and sudo are what Ansible and the deploy user need; the rest are
+# the tools worth having everywhere.
+base_packages:
+  - bash-completion
+  - bind9-dnsutils
+  - ca-certificates
+  - curl
+  - less
+  - nano
+  - python3
+  - sudo
+  - apt-listchanges
+  - git
+  - htop
+  - jq
+  - rsync
+  - tmux
+  - vim
+  - unattended-upgrades
+
+# Per host, in host_vars/<host>.yml (see inventory/host_vars/HOSTNAME.yml.example).
+extra_packages: []
+
+# Packages apt must not upgrade, per host (apt-mark hold). For Docker
+# on a host where a daemon restart takes down something that must not
+# restart unplanned. patch.yml leaves these alone too; release the hold
+# by hand for a planned upgrade.
+apt_holds: []
+
+# unattended-upgrades: Debian security updates only, applied daily.
+# Everything else waits for playbooks/patch.yml.
+unattended_upgrades_enabled: true
+
+# Never auto-upgraded, even from the security suite: restarting the
+# Docker daemon restarts every container on the host. These go through
+# patch.yml, which takes a snapshot first. Matched as regexes.
+unattended_upgrades_blacklist:
+  - "docker"
+  - "containerd"
+  - "runc"
+
+# unattended-upgrades never reboots on its own. patch.yml reboots when
+# /var/run/reboot-required exists.
+unattended_upgrades_reboot: false

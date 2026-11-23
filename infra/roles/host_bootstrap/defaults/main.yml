@@ -1,0 +1,9 @@
+---
+# Public half of the deploy keypair (the private half is the
+# SSH_PRIVATE_KEY CI/CD variable). Public keys aren't secret, so one
+# is safe to commit. This is a placeholder: set the real one in
+# inventory/group_vars/all.yml, which wins over this default.
+deploy_public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLEKEYCHANGEMECHANGEMECHANGEME deploy@example"
+
+# Shell given to the deploy user.
+deploy_user_shell: /bin/bash

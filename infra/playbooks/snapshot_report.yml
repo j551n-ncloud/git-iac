@@ -1,0 +1,40 @@
+---
+# Read-only: every Proxmox snapshot of every LXC in the inventory, oldest
+# first, marked by which tool made it and whether it gets pruned. Never
+# deletes anything.
+#
+#   ansible-playbook playbooks/snapshot_report.yml -e @.proxmox.json [--limit <host|group>]
+
+- name: Proxmox snapshots per LXC
+  hosts: all:!proxmox_nodes
+  gather_facts: false
+  connection: local
+  vars:
+    # prefix: (made by, newest kept)
+    snapshot_prefixes:
+      ci: "deploy repo pre-deploy, keeps 3"
+      patch: "infra patch.yml, keeps 2"
+      dist: "infra dist_upgrade.yml, keeps 1"
+  tasks:
+    - name: List snapshots
+      ansible.builtin.uri:
+        url: "{{ proxmox_api_url }}/api2/json/nodes/{{ proxmox_node }}/lxc/{{ proxmox_vmid }}/snapshot"
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_api_validate_certs | default(false) }}"
+        timeout: 30
+      delegate_to: localhost
+      register: snapshot_list
+      no_log: true
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ 'no snapshots' if not snaps else '' }}
+          {%- for s in snaps %}
+          {{ s.name }} ({{ snapshot_prefixes[s.name.split('-')[0]] | default('manual or other tool, never pruned') }})
+          {%- if not loop.last %};{% endif %}
+          {%- endfor %}
+      vars:
+        snaps: "{{ snapshot_list.json.data | rejectattr('name', 'equalto', 'current') | sort(attribute='name') | list }}"

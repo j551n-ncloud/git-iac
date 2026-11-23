@@ -1,0 +1,94 @@
+---
+# Read-only: which [base] hosts have pending apt updates, how many are
+# security updates, and which need a reboot. Writes host_updates.json
+# for scripts/host_updates_issue.py, which keeps one GitLab issue up to
+# date. Runs as the deploy user without sudo: `apt list --upgradable`
+# reads the lists the daily apt timer refreshes (roles/base enables it).
+#
+#   ansible-playbook playbooks/updates_report.yml
+
+- name: Collect pending updates
+  hosts: base
+  gather_facts: false
+  become: false
+  # An unreachable or failing host is reported in the issue, not a failed job.
+  ignore_errors: true
+  ignore_unreachable: true
+  tasks:
+    - name: Read pending updates, holds, reboot flag and list age
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import glob, json, os, shutil, subprocess, sys, time
+            if not shutil.which("apt"):
+                print(json.dumps({"skip": "no apt (not Debian)"}))
+                sys.exit(0)
+            def run(*a):
+                return subprocess.run(a, capture_output=True, text=True).stdout.splitlines()
+            up = [l.split(" [upgradable from")[0] for l in run("apt", "list", "--upgradable")
+                  if "/" in l and not l.startswith("Listing")]
+            rel = glob.glob("/var/lib/apt/lists/*Release")
+            print(json.dumps({
+                "upgradable": up,
+                "security": [l for l in up if "-security" in l.split()[0]],
+                "held": run("apt-mark", "showhold"),
+                "reboot_required": os.path.exists("/var/run/reboot-required"),
+                "lists_age_days": int((time.time() - max(map(os.path.getmtime, rel))) // 86400) if rel else -1,
+            }))
+      register: raw
+      changed_when: false
+
+    - name: Skip the parse on an unreachable host
+      ansible.builtin.meta: end_host
+      when: raw.unreachable | default(false)
+
+    - name: Skip hosts without apt
+      when: (raw.stdout | from_json).skip is defined
+      block:
+        - name: Mark as skipped, not unreachable
+          ansible.builtin.set_fact:
+            report_skipped: true
+
+        - name: Stop here for this host
+          ansible.builtin.meta: end_host
+
+    - name: Parse it
+      ansible.builtin.set_fact:
+        report: "{{ raw.stdout | from_json | combine({'host': inventory_hostname}) }}"
+
+- name: Write the report
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    reports: >-
+      {{ groups['base'] | map('extract', hostvars) | selectattr('report', 'defined')
+         | map(attribute='report') | list }}
+    skipped: >-
+      {{ groups['base'] | select('in', hostvars) | map('extract', hostvars) | selectattr('report_skipped', 'defined')
+         | map(attribute='inventory_hostname') | list }}
+  tasks:
+    - name: Write host_updates.json
+      ansible.builtin.copy:
+        dest: "{{ playbook_dir }}/../host_updates.json"
+        content: >-
+          {{ {'hosts': reports, 'unreachable': groups['base'] | difference(reports | map(attribute='host')) | difference(skipped) | sort}
+             | to_nice_json }}
+        mode: "0644"
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.host }}: {{ item.upgradable | length }} pending
+          ({{ item.security | length }} security){{ ', REBOOT REQUIRED' if item.reboot_required else '' }}{{
+          ', lists ' ~ item.lists_age_days ~ ' days old' if item.lists_age_days | int > 2 else '' }}
+      loop: "{{ reports }}"
+      loop_control:
+        label: "{{ item.host }}"
+
+    - name: Unreachable hosts
+      ansible.builtin.debug:
+        msg: "unreachable or failed: {{ groups['base'] | difference(reports | map(attribute='host')) | difference(skipped) | join(', ') }}"
+      when: groups['base'] | difference(reports | map(attribute='host')) | difference(skipped) | length > 0

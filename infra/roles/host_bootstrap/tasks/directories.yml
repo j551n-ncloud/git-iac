@@ -1,0 +1,13 @@
+---
+# The stacks root, owned by the deploy user. The per-stack directories
+# under it are the deploy repo's job (roles/docker_stack in the deploy repo
+# creates each one on deploy). A stack with a custom path: outside deploy_root and no
+# become: true needs that directory created once by hand.
+
+- name: Create the stacks root directory
+  ansible.builtin.file:
+    path: "{{ deploy_root }}"
+    state: directory
+    owner: "{{ deploy_user }}"
+    group: docker
+    mode: "0750"

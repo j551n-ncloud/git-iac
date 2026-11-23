@@ -1,0 +1,20 @@
+---
+# Tailscale settings for hosts that set tailscale_accept_routes (the
+# subnet routers, group_vars/edge_vpn.yml). Hosts without it are left
+# alone. Only touches the one pref; installing Tailscale, advertised
+# routes and the exit node stay as configured by hand.
+#
+# Why false on a subnet router: with accept-routes on, a standby router
+# installs the primary's LAN subnet into routing table 52, which wins over
+# the main table, so it answers LAN clients through tailscale0 and every
+# inbound connection to it (SSH, CI) times out.
+
+- name: Read Tailscale prefs
+  ansible.builtin.command: tailscale debug prefs
+  register: tailscale_prefs
+  changed_when: false
+  check_mode: false   # read-only, and the next task needs its output
+
+- name: Set accept-routes to {{ tailscale_accept_routes }}
+  ansible.builtin.command: tailscale set --accept-routes={{ tailscale_accept_routes | bool | lower }}
+  when: (tailscale_prefs.stdout | from_json).RouteAll | bool != tailscale_accept_routes | bool

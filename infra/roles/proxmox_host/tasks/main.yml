@@ -1,0 +1,29 @@
+---
+# Host prep on a Proxmox node: kernel modules and sysctls for privileged
+# k3s LXCs (they share the host kernel).
+
+- name: Modules loaded at boot
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/k3s.conf
+    content: "{{ proxmox_host_modules | join('\n') }}\n"
+    mode: "0644"
+
+- name: Modules loaded now
+  ansible.builtin.shell: lsmod | grep -qw '^{{ item }}' || { modprobe {{ item }} && echo loaded; }
+  loop: "{{ proxmox_host_modules }}"
+  register: proxmox_modprobe
+  changed_when: "'loaded' in proxmox_modprobe.stdout"
+
+- name: Sysctls
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/90-k3s.conf
+    content: |
+      {% for k, v in proxmox_host_sysctl.items() %}
+      {{ k }} = {{ v }}
+      {% endfor %}
+    mode: "0644"
+  register: proxmox_sysctl
+
+- name: Apply sysctls
+  ansible.builtin.command: sysctl -q --system
+  when: proxmox_sysctl.changed

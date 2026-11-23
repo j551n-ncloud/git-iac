@@ -1,0 +1,50 @@
+---
+# Suggestions for a new inventory line: next free vmid, free addresses in
+# the pool (lxc_ip_pool_*, not in the inventory, not answering ping) and
+# the node with the most free RAM. Changes nothing. bin/kickstart --free
+- name: Free vmid, addresses and node
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    inventory_dir_path: "{{ playbook_dir }}/../inventory"
+    api_headers:
+      Authorization: "PVEAPIToken={{ proxmox_api_token_id }}={{ proxmox_api_token_secret }}"
+  tasks:
+    - name: Read the cluster
+      ansible.builtin.uri:
+        url: "{{ proxmox_api_url }}/api2/json/{{ item }}"
+        headers: "{{ api_headers }}"
+        validate_certs: false
+        timeout: 30
+      loop: [cluster/resources?type=node, cluster/nextid]
+      register: cluster
+      no_log: true
+
+    # Commented-out hosts still own their address.
+    - name: Collect every address the inventory uses
+      ansible.builtin.shell: grep -hoE 'ansible_host=[0-9.]+' {{ inventory_dir_path }}/0* | cut -d= -f2
+      register: used_ips
+      changed_when: false
+
+    - name: Free addresses in the pool
+      ansible.builtin.shell: |
+        n=0
+        for i in $(seq {{ hostvars.localhost.lxc_ip_pool_first | default(lxc_ip_pool_first) }} {{ lxc_ip_pool_last }}); do
+          ip={{ lxc_ip_pool_prefix }}$i
+          echo "{{ used_ips.stdout_lines | join(' ') }}" | tr ' ' '\n' | grep -qx "$ip" && continue
+          ping -c 1 -W 1 "$ip" >/dev/null 2>&1 && continue
+          echo "$ip"; n=$((n+1)); [ $n -ge 3 ] && break
+        done
+      register: free_ips
+      changed_when: false
+
+    - name: Suggestion
+      ansible.builtin.debug:
+        msg:
+          - "next vmid:     {{ cluster.results[1].json.data }}"
+          - "free IPs:      {{ free_ips.stdout_lines | join(', ') }}"
+          - "most free RAM: {{ best.node }} ({{ ((best.maxmem - best.mem) / 2**30) | round(1) }} GB free)"
+          - "line:          <name>  ansible_host={{ free_ips.stdout_lines | first }}  proxmox_node={{ best.node }}  proxmox_vmid={{ cluster.results[1].json.data }}"
+      vars:
+        best: "{{ cluster.results[0].json.data | selectattr('status', 'equalto', 'online') | sort(attribute='mem') | first }}"

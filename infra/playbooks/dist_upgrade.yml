@@ -1,0 +1,133 @@
+---
+# Debian 12 (bookworm) -> 13 (trixie), one host at a time:
+#
+#   1. Proxmox snapshot (prefix "dist", newest 1 kept)
+#   2. full upgrade on bookworm first
+#   3. apt sources bookworm -> trixie (sources.list, *.list, *.sources;
+#      third-party repos too: some use "any", Tailscale and Docker
+#      have trixie suites)
+#   4. full-upgrade, keeping existing config files (confdef/confold)
+#   5. reboot, then assert Debian 13 and wait for patch_services/containers
+#
+# Skips hosts that are not on Debian 12, and hosts with apt_holds (they
+# hold something that must not restart unplanned and need their own
+# window). Stops at the first failure. Local only, like patch.yml.
+#
+# Lesson from doing this for real: read every line of the --check --diff
+# output and the package list before the real run. A dist-upgrade can
+# remove packages you rely on, and a snapshot is a rollback, not a review.
+#
+#   ansible-playbook playbooks/dist_upgrade.yml -e @.proxmox.json --limit app1 --check --diff
+#   ansible-playbook playbooks/dist_upgrade.yml -e @.proxmox.json --limit app1
+#
+# Rollback: Proxmox UI > the LXC > Snapshots > dist-<timestamp>.
+
+- name: Debian 12 -> 13
+  hosts: base
+  serial: 1
+  max_fail_percentage: 0
+  become: true
+  gather_facts: true
+  vars:
+    patch_container_wait_retries: 30
+  tasks:
+    - name: Skip what this playbook should not touch
+      when: >-
+        ansible_facts.distribution != 'Debian'
+        or ansible_facts.distribution_major_version != '12'
+        or (apt_holds | default([]) | length > 0)
+      block:
+        - name: Report the skip
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }}: {{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }}
+              {{ '(has apt_holds, needs a planned window)' if apt_holds | default([]) | length > 0 else '' }}, skipped.
+
+        - name: Stop here for this host
+          ansible.builtin.meta: end_host
+
+    - name: Snapshot the LXC first
+      ansible.builtin.include_role:
+        name: proxmox_snapshot
+        apply:
+          become: false
+      vars:
+        proxmox_snapshot_prefix: dist
+        proxmox_snapshot_keep: 1
+        proxmox_snapshot_reason: "Before Debian 13 upgrade (playbooks/dist_upgrade.yml)."
+      when: not ansible_check_mode   # a dry run takes no snapshot, so there is no task to wait for
+
+    - name: Record the containers running before
+      ansible.builtin.command: docker ps --format '{{ "{{" }}.Names{{ "}}" }}'
+      register: containers_before
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Bring bookworm fully up to date first
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: dist
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Find apt source files
+      ansible.builtin.find:
+        paths: /etc/apt/sources.list.d
+        patterns: ["*.list", "*.sources"]
+      register: source_files
+
+    - name: Switch apt sources to trixie
+      ansible.builtin.replace:
+        path: "{{ item }}"
+        regexp: '\bbookworm\b'
+        replace: trixie
+      loop: "{{ ['/etc/apt/sources.list'] + (source_files.files | map(attribute='path') | list) }}"
+      failed_when: false   # sources.list may not exist on deb822-only hosts
+
+    - name: Upgrade to trixie, keeping existing config files
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: dist
+        dpkg_options: force-confdef,force-confold
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      register: dist_result
+
+    - name: Reboot into trixie
+      ansible.builtin.reboot:
+        reboot_timeout: 600
+
+    - name: Read the new release
+      ansible.builtin.setup:
+        filter: ansible_distribution*
+
+    - name: It must be Debian 13 now
+      ansible.builtin.assert:
+        quiet: true
+        that: ansible_facts.distribution_major_version == '13'
+        fail_msg: "{{ inventory_hostname }} reports {{ ansible_facts.distribution_version }} after the upgrade."
+      when: not ansible_check_mode
+
+    - name: Wait until every container from before runs again
+      ansible.builtin.command: docker ps --format '{{ "{{" }}.Names{{ "}}" }}'
+      register: containers_after
+      changed_when: false
+      until: containers_before.stdout_lines | difference(containers_after.stdout_lines) | length == 0
+      retries: "{{ patch_container_wait_retries }}"
+      delay: 10
+      when: containers_before.rc == 0 and containers_before.stdout_lines | length > 0
+
+    - name: Wait until the host's own services are active again
+      ansible.builtin.command: systemctl is-active {{ item }}
+      register: service_state
+      changed_when: false
+      until: service_state.stdout == 'active'
+      retries: "{{ patch_container_wait_retries }}"
+      delay: 10
+      loop: "{{ patch_services | default([]) }}"
+      when: not ansible_check_mode
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: now Debian {{ ansible_facts.distribution_version }}."

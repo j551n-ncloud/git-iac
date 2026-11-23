@@ -1,0 +1,45 @@
+---
+# Baseline for a Debian host: the packages from base_packages plus
+# extra_packages, apt holds, and unattended-upgrades limited to Debian
+# security updates. Idempotent and additive: it installs, it never
+# removes.
+
+# Non-Debian hosts are skipped with a message, not failed.
+- name: Skip hosts that are not Debian
+  when: ansible_facts.os_family != 'Debian'
+  block:
+    - name: Report the skip
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} runs {{ ansible_facts.distribution }}, skipped (base only handles Debian)."
+
+    - name: Stop here for this host
+      ansible.builtin.meta: end_host
+
+- name: Install base and extra packages
+  ansible.builtin.apt:
+    name: "{{ base_packages + extra_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Hold packages that must not be upgraded unplanned
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop: "{{ apt_holds }}"
+
+- name: Configure unattended-upgrades (security only, Docker excluded)
+  ansible.builtin.template:
+    src: 52unattended-upgrades-local.j2
+    dest: /etc/apt/apt.conf.d/52unattended-upgrades-local
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Enable or disable the daily apt run
+  ansible.builtin.template:
+    src: 20auto-upgrades.j2
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    owner: root
+    group: root
+    mode: "0644"

@@ -1,0 +1,17 @@
+---
+# Docker CE from Docker's official apt repo: key in
+# /etc/apt/keyrings/docker.asc, source in sources.list.d/docker.list.
+docker_packages:
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-buildx-plugin
+  - docker-compose-plugin
+
+# Hosts that already run Debian's docker.io are skipped:
+# switching replaces the daemon and restarts every container, so it is a
+# planned step. Set true for that host to let the role remove docker.io
+# and docker-compose and install docker-ce instead.
+docker_replace_docker_io: false
+
+# /etc/docker/daemon.json is not managed (it differs per host on purpose).

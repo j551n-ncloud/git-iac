@@ -1,0 +1,63 @@
+# infra pipeline. Applying anything to hosts (bootstrap, base, patch)
+# stays local on purpose: patching the GitLab host or the runner restarts
+# what would run the job. CI only validates and reports.
+#
+# CI/CD variables:
+#   SSH_PRIVATE_KEY   File or Variable type, masked, protected. The deploy
+#                     key, same as the deploy repo's. Only check-host-updates
+#                     needs it.
+#   GITLAB_API_TOKEN  Project access token (api scope) for the updates issue;
+#                     CI_JOB_TOKEN is refused by some instances on issues.
+#   SCHEDULE_TASK     On the schedule: "check-host-updates".
+
+stages:
+  - validate
+  - check
+
+variables:
+  ANSIBLE_CONFIG: "$CI_PROJECT_DIR/ansible.cfg"
+  ANSIBLE_FORCE_COLOR: "true"
+
+.ansible_base:
+  image: ghcr.io/example-org/deploy-ci-image:latest
+  tags:
+    - docker
+  before_script:
+    - chmod go-w "$CI_PROJECT_DIR" || true
+    - ansible --version | head -1
+
+lint:
+  extends: .ansible_base
+  stage: validate
+  script:
+    - ansible-inventory --graph
+    - for p in playbooks/*.yml; do ansible-playbook "$p" --syntax-check; done
+    - python3 -m py_compile scripts/*.py
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+# Read-only. Pending apt updates, security count and reboot flag per
+# [base] host, kept in ONE issue (label host-updates) that closes itself
+# once everything is current. Runs as the deploy user without sudo.
+# CI/CD > Schedules: SCHEDULE_TASK=check-host-updates, e.g. "0 7 * * 1".
+check-host-updates:
+  extends: .ansible_base
+  stage: check
+  before_script:
+    - !reference [.ansible_base, before_script]
+    - eval "$(ssh-agent -s)" >/dev/null
+    - |
+      if [ -f "$SSH_PRIVATE_KEY" ]; then
+        install -m 600 "$SSH_PRIVATE_KEY" /tmp/deploy_key && ssh-add /tmp/deploy_key
+      else
+        echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+      fi
+  script:
+    - ansible-playbook playbooks/updates_report.yml
+    - python3 scripts/host_updates_issue.py host_updates.json
+  after_script:
+    - rm -f /tmp/deploy_key
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_TASK == "check-host-updates"'
