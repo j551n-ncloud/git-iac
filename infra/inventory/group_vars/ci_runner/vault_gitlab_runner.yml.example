@@ -1,0 +1,19 @@
+---
+# Copy to vault_gitlab_runner.yml (gitignored) and replace the value with
+# an encrypted one. Never commit a real token, encrypted or not.
+#
+# 1. GitLab: Settings > CI/CD > Runners > New project runner (or Admin
+#    area / group for a shared one). Set the tags and "run untagged jobs"
+#    THERE: with an authentication token they are fixed at creation and
+#    gitlab-runner register refuses them on the command line.
+# 2. Copy the token it shows once (starts with glrt-).
+# 3. Encrypt it:
+#
+#      ansible-vault encrypt_string --vault-password-file .vault_pass.txt \
+#        --name vault_gitlab_runner_token 'glrt-REPLACE_ME'
+#
+#    and paste the whole output below, in place of the plain line.
+#
+# Per-value !vault, one file per secret: rotating one key never decrypts
+# the others, and a diff shows which secret changed.
+vault_gitlab_runner_token: "glrt-REPLACE_ME"

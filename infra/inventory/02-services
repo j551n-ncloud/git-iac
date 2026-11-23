@@ -1,0 +1,18 @@
+# ======================================================
+#  Services
+# ======================================================
+
+# Docker stacks managed by the deploy repo (its host_vars list them).
+# One line per host: only deviations from the class defaults
+# (group_vars/all.yml) go on it.
+[services_apps]
+app1           ansible_host=192.168.1.61    proxmox_node=pve1  proxmox_vmid=201  lxc_cores=1 lxc_memory=1024 lxc_disk_gb=8   # Debian 13
+app2           ansible_host=192.168.1.62    proxmox_node=pve2  proxmox_vmid=202  lxc_cores=2 lxc_memory=4096 lxc_disk_gb=30  # Debian 13
+
+# Left over from an experiment, stopped. Stays in its group, commented
+# out, with the reason and date: Ansible never touches it, and
+# uncommenting brings it back.
+# app3         ansible_host=192.168.1.63  proxmox_node=pve3  proxmox_vmid=203  # stopped since 2026-01-01
+
+[services:children]
+services_apps

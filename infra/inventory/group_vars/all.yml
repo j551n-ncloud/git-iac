@@ -1,0 +1,73 @@
+---
+# Connection settings for every host, used by this repo and by the
+# deploy repo, which can read this inventory (see README.md).
+#
+# group_vars/ and host_vars/ must live INSIDE inventory/: Ansible
+# resolves them relative to the inventory source.
+
+# The account Ansible connects as for routine runs.
+ansible_user: deploy
+
+# The account bootstrap creates and that owns the stacks. Separate from
+# ansible_user: bootstrap.yml connects as root on a host where this
+# account doesn't exist yet, and overriding ansible_user for that must
+# not change which account gets created.
+deploy_user: deploy
+ansible_python_interpreter: /usr/bin/python3
+
+# Public half of the deploy keypair. Put YOUR public key here (the
+# private half stays on your workstation and in CI as SSH_PRIVATE_KEY).
+# Proxmox writes it into root's authorized_keys of every new LXC, so
+# bootstrap needs no password, and bootstrap installs it for the deploy
+# user. Placeholder below; proxmox_lxc refuses to run until it is changed.
+deploy_public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLEKEYCHANGEMECHANGEMECHANGEME deploy@example"
+
+# Created by bootstrap; the deploy repo puts one directory per stack
+# under it.
+deploy_root: /opt/stacks
+
+# Host key verification is deliberately OFF: these are addresses on a
+# private LAN, LXCs get rebuilt and re-addressed, and a committed
+# known_hosts goes stale every time. The cost: anything that takes over
+# one of these IPs receives what a deploy copies to it (rendered .env
+# files). Pubkey auth still protects the deploy key itself. Turn this
+# back on if your network is not yours alone.
+#
+# UserKnownHostsFile=/dev/null keeps the operator's ~/.ssh/known_hosts
+# clean; LogLevel=ERROR hides the "Permanently added" line.
+ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+
+# ------------------------------------------------------------------
+# LXC definition for playbooks/provision.yml. A host's line in
+# inventory/0x-* gives ansible_host, proxmox_node and proxmox_vmid; these
+# are the defaults for everything else.
+# Override per host on its line, e.g. `lxc_cores=4 lxc_memory=8192`.
+# provision.yml only CREATES missing LXCs; for existing ones it reports
+# where they differ from this and changes nothing.
+#
+# All addresses in this example inventory (192.168.1.x) are examples.
+# Use your own network.
+# ------------------------------------------------------------------
+# Check what you have: `pveam list local` on a node (download with
+# `pveam update && pveam download local <name>`).
+lxc_template: local:vztmpl/debian-13-standard_13.6-1_amd64.tar.zst
+lxc_storage: local-lvm        # must support snapshots (LVM-thin, ZFS, btrfs), see patch.yml
+lxc_disk_gb: 16
+lxc_cores: 2
+lxc_memory: 2048        # MB
+lxc_swap: 512           # MB
+lxc_bridge: vmbr0
+lxc_gateway: 192.168.1.1
+lxc_prefix: 24
+lxc_nameserver: "192.168.1.1"
+lxc_features: "nesting=1,keyctl=1"   # nesting for Docker
+lxc_unprivileged: true
+lxc_onboot: true
+lxc_firewall: true
+
+# Address pool bin/kickstart --free suggests a static IP from: not in
+# the inventory (commented lines count) and not answering ping. Keep
+# your router's DHCP pool out of this range.
+lxc_ip_pool_first: 33
+lxc_ip_pool_last: 49
+lxc_ip_pool_prefix: "192.168.1."

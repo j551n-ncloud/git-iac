@@ -1,0 +1,9 @@
+---
+# Tailscale subnet routers. Never accept routes: a standby router would put
+# the primary's LAN subnet into routing table 52 and answer LAN clients
+# through tailscale0, so SSH and CI to it time out (roles/tailscale).
+tailscale_accept_routes: false
+# patch.yml waits for these to be active again after an upgrade.
+patch_services:
+  - tailscaled
+lxc_disk_gb: 8

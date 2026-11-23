@@ -1,0 +1,20 @@
+---
+# The CI runner LXC: Docker (roles/docker, via docker_hosts) plus the
+# gitlab-runner package (roles/gitlab_runner, playbooks/runner.yml).
+lxc_cores: 2
+lxc_memory: 4096
+lxc_swap: 512
+lxc_disk_gb: 30
+lxc_features: "nesting=1,keyctl=1"
+
+# Your GitLab. gitlab.com or a self-hosted instance, no trailing slash.
+gitlab_runner_url: https://gitlab.example.com
+# How many jobs run at once. Each job is a container on this one LXC,
+# so keep it in line with lxc_cores and lxc_memory above.
+gitlab_runner_concurrent: 2
+# Default image for jobs that do not set `image:`.
+gitlab_runner_docker_image: alpine:latest
+
+# The authentication token (glrt-...) from the GitLab UI. Per-value
+# !vault in vault_gitlab_runner.yml, see the .example next to this file.
+gitlab_runner_token: "{{ vault_gitlab_runner_token }}"

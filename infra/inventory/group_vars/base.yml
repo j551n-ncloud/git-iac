@@ -1,0 +1,7 @@
+---
+# Hosts in [base] get packages and upgrades from playbooks/base.yml and
+# playbooks/patch.yml, which need root. Bootstrap therefore gives their
+# deploy user passwordless sudo (roles/host_bootstrap/tasks/sudo.yml).
+# A single host can opt out in its host_vars (deploy_user_sudo: false),
+# see host_vars/HOSTNAME.yml.example.
+deploy_user_sudo: true

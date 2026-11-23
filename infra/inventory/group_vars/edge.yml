@@ -1,0 +1,7 @@
+---
+# Size of every edge LXC. A subnet router needs next to nothing: measure
+# yours for a few weeks before sizing up.
+lxc_cores: 1
+lxc_memory: 512
+lxc_swap: 256
+lxc_features: "nesting=1"
